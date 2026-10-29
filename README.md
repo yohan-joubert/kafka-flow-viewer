@@ -27,16 +27,36 @@ java -jar target/kafka-flow-viewer.jar --bootstrap localhost:9092
 ```
 
 The load generator creates `demo.*` topics, a few producers (one transactional) and consumer groups, including
-`slow-reporting`, which is deliberately too slow so you can watch its lag climb. Don't run it against production.
+`slow-reporting`, which is deliberately too slow so you can watch its lag climb. It also runs a two-step processing
+chain, `demo.orders → order-enricher → demo.orders-enriched → shipping → demo.shipments → tracking`, using
+exactly-once consume-process-produce. Don't run it against production.
 
 ## Using the UI
 
-- **Hover** a node to highlight everything connected to it; **click** it for details: rate and lag history,
+- **Hover** a node to highlight its lineage, everything upstream and downstream of it; **click** it for details: rate and lag history,
   per-topic breakdown, group members with their client id, host and partition count.
 - **Filter** matches topic, group and producer names; a topic is shown if it, or anything connected to it, matches.
 - **Hide idle** removes topics with no traffic in or out.
 - Link thickness and particle speed follow the rate (log scale). Dotted grey links carry nothing right now.
   A consume link turns red when that group's lag on that topic has been trending up for the last ~10 samples.
+
+## Processing chains
+
+When a consumer group also writes to other topics (consume → transform → produce), the viewer draws it as a
+processing step, so pipelines read left to right across as many columns as they need:
+
+```
+payment-processor → payments → fraud-check → payments-verified → ledger-writer → ledger-entries → reporting
+```
+
+Kafka has no record of which producer belongs to which consumer group, so the link is made by naming: a producer
+whose `transactional.id` equals the group id, or starts with `<group id>-`, is folded into that group. Kafka Streams
+does this on its own with `processing.guarantee=exactly_once_v2` (`group.id` = `application.id`, transactional ids
+`<application.id>-…`), and so does any hand-written exactly-once relay that follows the convention. Relays that
+aren't transactional still show up, but as separate producer nodes, so the chain appears broken at that step.
+
+Hovering or selecting any node highlights its whole lineage: everything upstream that feeds it and everything
+downstream that depends on it.
 
 ## How the numbers are measured
 
@@ -51,6 +71,7 @@ exponential moving average (`rate.smoothing`).
 | Group members | `describeConsumerGroups`: client id, host, assigned partitions |
 | Producers and their rate | `describeProducers` (KIP-664): each producer's last sequence number per partition, which grows by one per record |
 | Producer names | transactional id via `listTransactions`, when the producer has one |
+| Group → producer (chains) | transactional id starting with the group id, see [Processing chains](#processing-chains) |
 
 ### Limits worth knowing
 

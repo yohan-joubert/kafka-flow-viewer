@@ -46,7 +46,11 @@ public record FlowSnapshot(
             List<MemberView> members,
             double rate,
             long lag,
-            List<String> topics
+            List<String> topics,
+            // Set when the group also writes (consume -> transform -> produce), see FlowCalculator.
+            double produceRate,
+            List<String> outputTopics,
+            List<Long> producerIds
     ) {}
 
     public record MemberView(String clientId, String host, List<String> topics, int partitions) {}

@@ -125,6 +125,9 @@ body {
   font-weight: 600;
   font-stretch: 112%;
   color: var(--ink-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #graph { display: block; overflow: visible; }
 
@@ -134,6 +137,7 @@ body {
 .node .accent { stroke-width: 3; stroke-linecap: round; }
 .node.producer .accent { stroke: var(--produce); }
 .node.group .accent { stroke: var(--consume); }
+.node.group .accent.out { stroke: var(--produce); }
 .node.synthetic rect.box { fill: transparent; stroke-dasharray: 4 3; }
 .node .name { fill: var(--ink); font-size: 14px; font-weight: 600; }
 .node .sub { fill: var(--ink-soft); font-size: 12.5px; }

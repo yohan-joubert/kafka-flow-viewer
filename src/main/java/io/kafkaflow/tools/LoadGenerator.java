@@ -2,24 +2,30 @@ package io.kafkaflow.tools;
 
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.TopicExistsException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
 /**
  * Generates some real traffic on a test cluster so there is something to look at:
- * a few producers and consumer groups on {@code demo.*} topics, one group deliberately slow.
+ * a few producers and consumer groups on {@code demo.*} topics, one group deliberately slow, and a
+ * two-step processing chain (orders -> order-enricher -> orders-enriched -> shipping -> shipments -> tracking).
  *
  * <pre>java -cp kafka-flow-viewer.jar io.kafkaflow.tools.LoadGenerator localhost:9092</pre>
  *
@@ -35,7 +41,9 @@ public final class LoadGenerator {
                 new NewTopic("demo.orders", 6, (short) 1),
                 new NewTopic("demo.payments", 3, (short) 1),
                 new NewTopic("demo.clicks", 12, (short) 1),
-                new NewTopic("demo.notifications", 3, (short) 1));
+                new NewTopic("demo.notifications", 3, (short) 1),
+                new NewTopic("demo.orders-enriched", 3, (short) 1),
+                new NewTopic("demo.shipments", 3, (short) 1));
 
         List<Thread> threads = new ArrayList<>();
         threads.add(producer(bootstrap, "checkout-1", "demo.orders", 120, null));
@@ -50,6 +58,14 @@ public final class LoadGenerator {
         threads.add(consumer(bootstrap, "mailer", List.of("demo.notifications"), 0));
         // Too slow on purpose: ~100 msg/s for ~200 msg/s of orders, so lag keeps growing.
         threads.add(consumer(bootstrap, "slow-reporting", List.of("demo.orders"), 100));
+
+
+        // A processing chain: checkout -> demo.orders -> order-enricher -> demo.orders-enriched
+        //                     -> shipping -> demo.shipments -> tracking
+        // Each relay's transactional.id starts with its group id, which is how the viewer links the two.
+        threads.add(relay(bootstrap, "order-enricher", "demo.orders", "demo.orders-enriched"));
+        threads.add(relay(bootstrap, "shipping", "demo.orders-enriched", "demo.shipments"));
+        threads.add(consumer(bootstrap, "tracking", List.of("demo.shipments"), 0));
 
         for (Thread t : threads) t.join();
     }
@@ -116,6 +132,51 @@ public final class LoadGenerator {
                     long t0 = System.nanoTime();
                     ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
                     if (maxPerSec > 0 && !records.isEmpty()) sleepRemaining(t0, 100);
+                }
+            } catch (Exception e) {
+                System.err.println(groupId + " stopped: " + e);
+            }
+        });
+    }
+
+    /**
+     * Consume -> transform -> produce with exactly-once semantics: offsets are committed inside the producer's
+     * transaction, like Kafka Streams with processing.guarantee=exactly_once_v2.
+     */
+    private static Thread relay(String bootstrap, String groupId, String inTopic, String outTopic) {
+        return Thread.ofPlatform().name("relay-" + groupId).start(() -> {
+            Properties c = new Properties();
+            c.put("bootstrap.servers", bootstrap);
+            c.put("group.id", groupId);
+            c.put("client.id", groupId + "-consumer");
+            c.put("auto.offset.reset", "latest");
+            c.put("enable.auto.commit", "false");
+            c.put("isolation.level", "read_committed");
+            c.put("key.deserializer", StringDeserializer.class.getName());
+            c.put("value.deserializer", StringDeserializer.class.getName());
+
+            Properties p = new Properties();
+            p.put("bootstrap.servers", bootstrap);
+            p.put("client.id", groupId + "-producer");
+            p.put("transactional.id", groupId + "-0");
+            p.put("key.serializer", StringSerializer.class.getName());
+            p.put("value.serializer", StringSerializer.class.getName());
+
+            try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(c);
+                 KafkaProducer<String, String> producer = new KafkaProducer<>(p)) {
+                producer.initTransactions();
+                consumer.subscribe(List.of(inTopic));
+                while (!Thread.currentThread().isInterrupted()) {
+                    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(200));
+                    if (records.isEmpty()) continue;
+                    producer.beginTransaction();
+                    Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
+                    for (ConsumerRecord<String, String> r : records) {
+                        producer.send(new ProducerRecord<>(outTopic, r.key(), "{\"from\":\"" + groupId + "\",\"in\":" + r.value() + "}"));
+                        offsets.put(new TopicPartition(r.topic(), r.partition()), new OffsetAndMetadata(r.offset() + 1));
+                    }
+                    producer.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+                    producer.commitTransaction();
                 }
             } catch (Exception e) {
                 System.err.println(groupId + " stopped: " + e);

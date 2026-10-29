@@ -16,9 +16,16 @@ import java.util.Set;
 import java.util.TreeSet;
 
 /**
- * A fake e-commerce cluster for trying the UI without Kafka ({@code --demo}). Traffic varies over time, one
- * consumer group is too slow and builds lag, one producer pauses periodically, and the click stream comes from
- * non-idempotent producers so it shows up as "unidentified".
+ * A fake e-commerce cluster for trying the UI without Kafka ({@code --demo}).
+ *
+ * <p>Besides plain producers and consumers it has processing chains, where a consumer group writes what it reads
+ * to the next topic (consume -> transform -> produce), for example:
+ * <pre>payment-processor -> payments -> fraud-check -> payments-verified -> ledger-writer -> ledger-entries -> reporting</pre>
+ * Relay producers use a transactional id starting with their group id, as Kafka Streams does with exactly-once,
+ * which is how the viewer ties them to their group.
+ *
+ * <p>Traffic varies over time, inventory-sync is too slow and builds lag, one producer pauses periodically, and the
+ * click stream comes from non-idempotent producers so it shows up as "unidentified".
  */
 public final class SimulatedClusterSource implements ClusterSource {
 
@@ -27,8 +34,25 @@ public final class SimulatedClusterSource implements ClusterSource {
     /** A producer writing {@code baseRate} msg/s into each listed topic. */
     private record Producer(long id, String txId, Map<String, Double> baseRate, boolean idempotent, int pauseEverySec) {}
 
-    /** A consumer group able to process {@code capacity} msg/s per topic (null = always keeps up). */
-    private record Group(String id, List<String> topics, Double capacity, int members, String clientPrefix) {}
+    /**
+     * A consumer group able to process {@code capacity} msg/s per topic (null = always keeps up).
+     * If {@code outputs} is not empty the group is a processing step: for every message consumed it writes
+     * {@code ratio} messages to each output topic, with producer {@code relayId} / {@code relayTxId}.
+     */
+    private record Group(String id, List<String> topics, Double capacity, int members, String clientPrefix,
+                         Map<String, Double> outputs, long relayId, String relayTxId) {
+
+        static Group consumer(String id, List<String> topics, Double capacity, int members, String clientPrefix) {
+            return new Group(id, topics, capacity, members, clientPrefix, Map.of(), 0, null);
+        }
+
+        static Group relay(String id, List<String> topics, int members, String clientPrefix,
+                           Map<String, Double> outputs, long relayId, String relayTxId) {
+            return new Group(id, topics, null, members, clientPrefix, outputs, relayId, relayTxId);
+        }
+    }
+
+    private record ProducerKey(long producerId, Tp tp) {}
 
     private final Random random = new Random(42);
     private final long start = System.currentTimeMillis();
@@ -37,6 +61,8 @@ public final class SimulatedClusterSource implements ClusterSource {
     private final List<Topic> topics = List.of(
             new Topic("orders", 6),
             new Topic("payments", 3),
+            new Topic("payments-verified", 3),
+            new Topic("ledger-entries", 6),
             new Topic("shipments", 3),
             new Topic("inventory-updates", 12),
             new Topic("user-clicks", 24),
@@ -51,24 +77,31 @@ public final class SimulatedClusterSource implements ClusterSource {
             new Producer(4020, null, Map.of("shipments", 35.0), true, 90),
             new Producer(4030, null, Map.of("inventory-updates", 260.0), true, 0),
             new Producer(4031, null, Map.of("inventory-updates", 240.0), true, 0),
-            new Producer(4040, "order-enricher-0", Map.of("notifications", 55.0, "orders-dlq", 0.4), true, 0),
             new Producer(0, null, Map.of("user-clicks", 850.0), false, 0));
 
+    // Upstream steps before downstream ones, so a message can travel the whole chain within one sample.
     private final List<Group> groups = List.of(
-            new Group("payment-service", List.of("orders"), null, 3, "payment-service"),
-            new Group("fulfillment", List.of("orders", "payments"), null, 2, "fulfillment"),
-            new Group("order-enricher", List.of("orders"), null, 2, "order-enricher-StreamThread"),
-            new Group("shipping-tracker", List.of("shipments"), null, 1, "shipping-tracker"),
-            new Group("inventory-sync", List.of("inventory-updates"), 430.0, 4, "inventory-sync"),
-            new Group("clickstream-analytics", List.of("user-clicks"), null, 6, "spark-executor"),
-            new Group("notifier", List.of("notifications"), null, 2, "notifier"),
-            new Group("dlq-inspector", List.of("orders-dlq"), null, 1, "dlq-inspector"),
-            new Group("audit-archiver", List.of("audit-log"), null, 0, "audit-archiver"));
+            Group.consumer("payment-service", List.of("orders"), null, 3, "payment-service"),
+            Group.consumer("fulfillment", List.of("orders", "payments"), null, 2, "fulfillment"),
+            Group.relay("order-enricher", List.of("orders"), 2, "order-enricher-StreamThread",
+                    Map.of("notifications", 0.27, "orders-dlq", 0.002), 4040, "order-enricher-7c1e2f-0"),
+            Group.relay("fraud-check", List.of("payments"), 2, "fraud-check",
+                    Map.of("payments-verified", 0.97), 4050, "fraud-check-0"),
+            Group.relay("ledger-writer", List.of("payments-verified"), 2, "ledger-writer",
+                    Map.of("ledger-entries", 2.0), 4060, "ledger-writer-0"),
+            Group.consumer("reporting", List.of("ledger-entries"), null, 1, "reporting"),
+            Group.consumer("shipping-tracker", List.of("shipments"), null, 1, "shipping-tracker"),
+            Group.consumer("inventory-sync", List.of("inventory-updates"), 430.0, 4, "inventory-sync"),
+            Group.consumer("clickstream-analytics", List.of("user-clicks"), null, 6, "spark-executor"),
+            Group.consumer("notifier", List.of("notifications"), null, 2, "notifier"),
+            Group.consumer("dlq-inspector", List.of("orders-dlq"), null, 1, "dlq-inspector"),
+            Group.consumer("audit-archiver", List.of("audit-log"), null, 0, "audit-archiver"));
 
     private final Map<Tp, Long> endOffsets = new HashMap<>();
     private final Map<String, Map<Tp, Long>> committed = new HashMap<>();
-    private final Map<String, Integer> sequences = new HashMap<>(); // producerId|tp -> last sequence
-    private final Map<String, Long> lastWrite = new HashMap<>();
+    private final Map<ProducerKey, Integer> sequences = new HashMap<>();
+    private final Map<ProducerKey, Long> lastWrite = new HashMap<>();
+    private final Map<Long, String> transactionalIds = new HashMap<>();
     private final Map<String, Double> carry = new HashMap<>();       // fractional messages not yet written
 
     public SimulatedClusterSource() {
@@ -100,35 +133,21 @@ public final class SimulatedClusterSource implements ClusterSource {
         double t = (now - start) / 1000.0;
         last = now;
 
-        // Produce.
+        // Producers at the edge of the system.
         for (Producer pr : producers) {
             if (pr.pauseEverySec() > 0 && (t % pr.pauseEverySec()) > pr.pauseEverySec() * 0.65) continue;
             for (Map.Entry<String, Double> e : pr.baseRate().entrySet()) {
                 double wave = 1 + 0.35 * Math.sin(t / 23.0 + pr.id()) + 0.15 * Math.sin(t / 5.0 + pr.id() * 0.7);
                 double count = e.getValue() * wave * dt * (0.9 + 0.2 * random.nextDouble());
-                String carryKey = pr.id() + "|" + e.getKey();
-                count += carry.getOrDefault(carryKey, 0.0);
-                long whole = (long) count;
-                carry.put(carryKey, count - whole);
-                List<Tp> parts = partitions(e.getKey());
-                for (long i = 0; i < whole; ) {
-                    Tp tp = parts.get(random.nextInt(parts.size()));
-                    long batch = Math.min(whole - i, 1 + random.nextInt(50));
-                    endOffsets.merge(tp, batch, Long::sum);
-                    if (pr.idempotent()) {
-                        String key = pr.id() + "|" + tp.topic() + "|" + tp.partition();
-                        sequences.merge(key, (int) batch, Integer::sum);
-                        lastWrite.put(key, now);
-                    }
-                    i += batch;
-                }
+                write(pr.id(), pr.idempotent() ? pr.txId() : null, pr.idempotent(), e.getKey(), count, now);
             }
         }
 
-        // Consume.
+        // Consumers, then whatever the processing steps write downstream.
         for (Group g : groups) {
             if (g.members() == 0) continue;
             Map<Tp, Long> c = committed.get(g.id());
+            long consumed = 0;
             for (String topic : g.topics()) {
                 List<Tp> parts = partitions(topic);
                 double budget = g.capacity() == null ? Double.MAX_VALUE : g.capacity() * dt / parts.size();
@@ -137,13 +156,39 @@ public final class SimulatedClusterSource implements ClusterSource {
                     long cur = c.getOrDefault(tp, end);
                     // Consumers commit periodically, so they trail the end offset a little even when keeping up.
                     long target = g.capacity() == null ? end - random.nextInt(20) : (long) (cur + budget);
-                    c.put(tp, Math.max(cur, Math.min(end, target)));
+                    long next = Math.max(cur, Math.min(end, target));
+                    consumed += next - cur;
+                    c.put(tp, next);
                 }
+            }
+            for (Map.Entry<String, Double> out : g.outputs().entrySet()) {
+                write(g.relayId(), g.relayTxId(), true, out.getKey(), consumed * out.getValue(), now);
             }
         }
 
         return new ClusterSample(now, "demo-cluster-7Hq2", 3, topicSamples(), groupSamples(), producerSamples(now),
                 List.of());
+    }
+
+    /** Appends {@code count} messages (fractions carried over) to random partitions of a topic. */
+    private void write(long producerId, String txId, boolean idempotent, String topic, double count, long now) {
+        String carryKey = producerId + "|" + topic;
+        count += carry.getOrDefault(carryKey, 0.0);
+        long whole = (long) count;
+        carry.put(carryKey, count - whole);
+        if (txId != null) transactionalIds.put(producerId, txId);
+        List<Tp> parts = partitions(topic);
+        for (long i = 0; i < whole; ) {
+            Tp tp = parts.get(random.nextInt(parts.size()));
+            long batch = Math.min(whole - i, 1 + random.nextInt(50));
+            endOffsets.merge(tp, batch, Long::sum);
+            if (idempotent) {
+                ProducerKey key = new ProducerKey(producerId, tp);
+                sequences.merge(key, (int) batch, Integer::sum);
+                lastWrite.put(key, now);
+            }
+            i += batch;
+        }
     }
 
     private Map<String, TopicSample> topicSamples() {
@@ -175,16 +220,12 @@ public final class SimulatedClusterSource implements ClusterSource {
 
     private List<ProducerSample> producerSamples(long now) {
         List<ProducerSample> out = new ArrayList<>();
-        for (Producer pr : producers) {
-            if (!pr.idempotent()) continue;
-            for (String topic : pr.baseRate().keySet()) {
-                for (Tp tp : partitions(topic)) {
-                    String key = pr.id() + "|" + tp.topic() + "|" + tp.partition();
-                    Long written = lastWrite.get(key);
-                    if (written == null || now - written > 60_000) continue;
-                    out.add(new ProducerSample(pr.id(), 0, tp, sequences.get(key) - 1, written, pr.txId()));
-                }
-            }
+        for (Map.Entry<ProducerKey, Integer> e : sequences.entrySet()) {
+            ProducerKey key = e.getKey();
+            Long written = lastWrite.get(key);
+            if (written == null || now - written > 60_000) continue;
+            out.add(new ProducerSample(key.producerId(), 0, key.tp(), e.getValue() - 1, written,
+                    transactionalIds.get(key.producerId())));
         }
         return out;
     }

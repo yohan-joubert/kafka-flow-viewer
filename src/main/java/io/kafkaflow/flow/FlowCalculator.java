@@ -17,10 +17,12 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Turns consecutive {@link ClusterSample}s into a {@link FlowSnapshot}: every rate is
@@ -121,7 +123,7 @@ public final class FlowCalculator {
             }
             members.sort(Comparator.comparing(MemberView::clientId, Comparator.nullsLast(Comparator.naturalOrder())));
             groups.add(new GroupView(gid, g.groupId(), g.state(), members, groupRate, groupLag,
-                    List.copyOf(deltaByTopic.keySet())));
+                    List.copyOf(deltaByTopic.keySet()), 0, List.of(), List.of()));
         }
 
         // ---- producers: sequence-number growth --------------------------------------------------
@@ -174,6 +176,60 @@ public final class FlowCalculator {
                     now.timestampMs(), residualTopics));
         }
 
+        // ---- chains: groups that also write (consume -> transform -> produce) --------------------
+        // Kafka has no link between a consumer group and a producer, except by naming: Kafka Streams with
+        // exactly-once uses group.id = application.id and transactional.id = "<application.id>-...".
+        // Any producer whose transactional id is the group id, or starts with "<group id>-", is folded into
+        // that group, so the group becomes a processing step: topic -> group -> topic.
+        Map<String, List<ProducerView>> relays = new TreeMap<>();
+        List<ProducerView> standalone = new ArrayList<>();
+        List<String> groupIds = new ArrayList<>();
+        for (GroupView g : groups) groupIds.add(g.groupId());
+        for (ProducerView p : producers) {
+            String owner = p.synthetic() ? null : owningGroup(p.transactionalId(), groupIds);
+            if (owner == null) standalone.add(p);
+            else relays.computeIfAbsent(owner, k -> new ArrayList<>()).add(p);
+        }
+        if (!relays.isEmpty()) {
+            Map<String, String> newSource = new HashMap<>();
+            for (Map.Entry<String, List<ProducerView>> e : relays.entrySet()) {
+                for (ProducerView p : e.getValue()) newSource.put(p.id(), "g:" + e.getKey());
+            }
+            Map<String, Link> merged = new LinkedHashMap<>();
+            for (Link l : links) {
+                String src = newSource.get(l.source());
+                if (src == null) {
+                    merged.put(l.id(), l);
+                    continue;
+                }
+                String id = src + ">" + l.target().substring(2);
+                Link prev = merged.get(id);
+                merged.put(id, new Link(id, src, l.target(), "produce", l.rate() + (prev == null ? 0 : prev.rate()), 0));
+            }
+            links = new ArrayList<>(merged.values());
+
+            List<GroupView> withRelays = new ArrayList<>(groups.size());
+            for (GroupView g : groups) {
+                List<ProducerView> ps = relays.get(g.groupId());
+                if (ps == null) {
+                    withRelays.add(g);
+                    continue;
+                }
+                double out = 0;
+                Set<String> outTopics = new TreeSet<>();
+                List<Long> ids = new ArrayList<>();
+                for (ProducerView p : ps) {
+                    out += p.rate();
+                    outTopics.addAll(p.topics());
+                    ids.add(p.producerId());
+                }
+                withRelays.add(new GroupView(g.id(), g.groupId(), g.state(), g.members(), g.rate(), g.lag(), g.topics(),
+                        out, List.copyOf(outTopics), ids));
+            }
+            groups = withRelays;
+            producers = standalone;
+        }
+
         // ---- topics view + totals -----------------------------------------------------------
         List<TopicView> topics = new ArrayList<>();
         double totalIn = 0, totalOut = 0;
@@ -200,6 +256,17 @@ public final class FlowCalculator {
                 before == null,
                 new Totals(totalIn, totalOut, totalLag, topics.size(), groups.size(), producers.size(), totalMessages),
                 topics, groups, producers, links, now.warnings(), null);
+    }
+
+    /** The group a transactional producer belongs to by naming convention (longest matching group id), or null. */
+    static String owningGroup(String transactionalId, List<String> groupIds) {
+        if (transactionalId == null) return null;
+        String best = null;
+        for (String g : groupIds) {
+            boolean match = transactionalId.equals(g) || transactionalId.startsWith(g + "-");
+            if (match && (best == null || g.length() > best.length())) best = g;
+        }
+        return best;
     }
 
     /** Records written between two observations of the same producer on the same partition. */

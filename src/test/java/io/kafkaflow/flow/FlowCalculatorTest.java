@@ -65,4 +65,43 @@ class FlowCalculatorTest {
         assertEquals(0, s.topics().get(0).inRate());
         assertEquals(0, s.groups().get(0).rate());
     }
+
+    @Test
+    void groupThatWritesBecomesAProcessingStepInTheChain() {
+        // p1 -> in -> relay (group, transactional.id "relay-0") -> out -> sink
+        FlowCalculator calc = new FlowCalculator(0);
+        calc.update(chainSample(0, 0, 0, 0, 0), "test", 1000);
+        FlowSnapshot s = calc.update(chainSample(1000, 100, 100, 100, 100), "test", 1000);
+
+        assertEquals(1, s.producers().size()); // only p1; the relay producer is folded into its group
+        FlowSnapshot.GroupView relay = s.groups().get(0);
+        assertEquals("relay", relay.groupId());
+        assertEquals(100.0, relay.produceRate(), 1e-9);
+        assertEquals("out", relay.outputTopics().get(0));
+        assertTrue(s.links().stream().anyMatch(l ->
+                l.source().equals("g:relay") && l.target().equals("t:out") && l.kind().equals("produce")));
+        assertTrue(s.links().stream().anyMatch(l -> l.source().equals("t:out") && l.target().equals("g:sink")));
+    }
+
+    @Test
+    void owningGroupUsesLongestPrefix() {
+        List<String> groups = List.of("app", "app-orders", "other");
+        assertEquals("app-orders", FlowCalculator.owningGroup("app-orders-3f2a-1", groups));
+        assertEquals("app", FlowCalculator.owningGroup("app-9c1d-0", groups));
+        assertEquals("app", FlowCalculator.owningGroup("app", groups));
+        assertTrue(FlowCalculator.owningGroup("application-0", groups) == null);
+        assertTrue(FlowCalculator.owningGroup(null, groups) == null);
+    }
+
+    private static ClusterSample chainSample(long t, long inEnd, long relayCommitted, long outEnd, long sinkCommitted) {
+        Tp in = new Tp("in", 0), out = new Tp("out", 0);
+        return new ClusterSample(t, "c1", 1,
+                Map.of("in", new TopicSample("in", 1, 1, Map.of(0, inEnd)),
+                        "out", new TopicSample("out", 1, 1, Map.of(0, outEnd))),
+                List.of(new GroupSample("relay", "STABLE", List.of(), Map.of(in, relayCommitted)),
+                        new GroupSample("sink", "STABLE", List.of(), Map.of(out, sinkCommitted))),
+                List.of(new ProducerSample(1, 0, in, (int) inEnd - 1, t, null),
+                        new ProducerSample(2, 0, out, (int) outEnd - 1, t, "relay-0")),
+                List.of());
+    }
 }

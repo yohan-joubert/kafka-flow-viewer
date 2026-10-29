@@ -2,7 +2,7 @@
 
 /* Kafka Flow Viewer UI: draws producers -> topics -> consumer groups from server-sent snapshots. */
 
-const NODE_W = 236;
+const nodeW = 236;
 const NODE_H = 50;
 const ROW = 62;
 const HISTORY = 150;               // samples kept per node (5 min at the default 2 s interval)
@@ -56,6 +56,9 @@ const fmtRate = (r) => fmtNum(r) + "/s";
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+
+/** Characters that fit in a node after reserving `reserved` px for padding and side labels. */
+const fit = (reserved) => Math.max(8, Math.floor((nodeW - reserved) / 7.6));
 
 function clip(s, max) {
   return s.length > max ? s.slice(0, max - 1) + "…" : s;
@@ -159,7 +162,7 @@ function visibleGraph() {
     }
   }
 
-  let topics = s.topics.filter((t) => !(hideIdle && t.inRate === 0 && t.outRate === 0));
+  let topics = s.topics.map((t) => state.nodes.get(t.id)).filter((t) => !(hideIdle && t.inRate === 0 && t.outRate === 0));
   if (q) {
     const matchingOthers = new Set(
       [...s.producers, ...s.groups].filter((n) => label(n).includes(q)).map((n) => n.id));
@@ -181,16 +184,66 @@ function visibleGraph() {
 }
 
 // ---------- layout ----------
+//
+// Layered left-to-right layout: every link points to a column further right. Plain flows take three columns
+// (producers, topics, consumer groups); a group that also writes pushes its output topics one column further,
+// so a chain p1 -> topic -> c1 -> topic -> c2 reads left to right.
 
-function place(nodes, anchorY, fallbackStart) {
+function columnsOf(g) {
+  const nodes = [...g.producers, ...g.topics, ...g.groups];
+  const ids = new Set(nodes.map((n) => n.id));
+  const succ = new Map(nodes.map((n) => [n.id, []]));
+  const pred = new Map(nodes.map((n) => [n.id, []]));
+  const edges = g.links.filter((l) => ids.has(l.source) && ids.has(l.target) && l.source !== l.target);
+
+  // Drop the edges that close a cycle (a group writing back to a topic upstream of itself) before layering.
+  const back = new Set();
+  const stateOf = new Map();
+  const out = new Map(nodes.map((n) => [n.id, []]));
+  for (const l of edges) out.get(l.source).push(l);
+  const visit = (id) => {
+    stateOf.set(id, 1);
+    for (const l of out.get(id)) {
+      const st = stateOf.get(l.target);
+      if (st === 1) back.add(l);
+      else if (!st) visit(l.target);
+    }
+    stateOf.set(id, 2);
+  };
+  for (const n of nodes) if (!stateOf.get(n.id)) visit(n.id);
+  const dag = edges.filter((l) => !back.has(l));
+  for (const l of dag) { succ.get(l.source).push(l.target); pred.get(l.target).push(l.source); }
+
+  const base = { producer: 0, topic: 1, group: 2 };
+  const layer = new Map(nodes.map((n) => [n.id, base[n.kind]]));
+  for (let changed = true, guard = 0; changed && guard <= nodes.length; guard++) {
+    changed = false;
+    for (const l of dag) {
+      if (layer.get(l.target) <= layer.get(l.source)) { layer.set(l.target, layer.get(l.source) + 1); changed = true; }
+    }
+  }
+  // Sources sit just left of what they feed, instead of all the way left.
+  const bySourceDepth = nodes.filter((n) => !pred.get(n.id).length && succ.get(n.id).length)
+    .sort((x, y) => layer.get(y.id) - layer.get(x.id));
+  for (const n of bySourceDepth) {
+    layer.set(n.id, Math.max(layer.get(n.id), Math.min(...succ.get(n.id).map((t) => layer.get(t))) - 1));
+  }
+
+  const used = [...new Set(layer.values())].sort((x, y) => x - y);
+  const cols = used.map(() => []);
+  for (const n of nodes) cols[used.indexOf(layer.get(n.id))].push(n);
+  return { cols, succ, pred };
+}
+
+function place(nodes, anchorY) {
   const items = nodes.map((n) => {
     const ys = anchorY(n);
     return { n, want: ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : Infinity };
   });
-  items.sort((a, b) => a.want - b.want || (a.n.label || a.n.groupId || "").localeCompare(b.n.label || b.n.groupId || ""));
+  items.sort((a, b) => a.want - b.want || nameOf(a.n).localeCompare(nameOf(b.n)));
   let next = 0;
   for (const it of items) {
-    const want = isFinite(it.want) ? it.want : Math.max(next, fallbackStart);
+    const want = isFinite(it.want) ? it.want : next;
     it.n._y = Math.max(want, next);
     next = it.n._y + ROW;
   }
@@ -202,24 +255,47 @@ function place(nodes, anchorY, fallbackStart) {
   }
 }
 
+const nameOf = (n) => n.name || n.groupId || n.label || "";
+
 function layout(g) {
+  const { cols, succ, pred } = columnsOf(g);
   const width = els.canvas.clientWidth - 56;
-  const gap = Math.max(150, Math.min(380, (width - NODE_W * 3) / 2));
-  const xs = { producer: 0, topic: NODE_W + gap, group: 2 * (NODE_W + gap) };
+  const k = Math.max(cols.length, 1);
+  // Deep chains get tighter gaps first; past that the canvas scrolls sideways rather than squeezing the text.
+  const gap = k > 1 ? Math.max(90, Math.min(380, (width - nodeW * k) / (k - 1))) : 0;
 
-  g.topics.forEach((t, i) => { t._y = i * ROW; });
-  const yOf = new Map(g.topics.map((t) => [t.id, t._y]));
-  const linkedTopics = (n) => g.links
-    .filter((l) => l.source === n.id || l.target === n.id)
-    .map((l) => yOf.get(l.kind === "produce" ? l.target : l.source))
-    .filter((y) => y != null);
+  const all = cols.flat();
+  for (const n of all) n._y = undefined;
+  const byId = new Map(all.map((n) => [n.id, n]));
+  const ys = (list) => list.map((id) => byId.get(id)?._y).filter((y) => y != null);
 
-  place(g.producers, linkedTopics, 0);
-  place(g.groups, linkedTopics, 0);
+  // Anchor on the first column of topics, alphabetically, then spread outwards following the links.
+  let anchor = cols.findIndex((c) => c.some((n) => n.kind === "topic"));
+  if (anchor < 0) anchor = 0;
+  cols[anchor].sort((x, y) => (x.kind === "topic" ? 0 : 1) - (y.kind === "topic" ? 0 : 1) || nameOf(x).localeCompare(nameOf(y)));
+  cols[anchor].forEach((n, i) => { n._y = i * ROW; });
+  for (let pass = 0; pass < 2; pass++) {
+    for (let c = anchor + 1; c < cols.length; c++) {
+      place(cols[c], (n) => { const p = ys(pred.get(n.id)); return p.length ? p : ys(succ.get(n.id)); });
+    }
+    for (let c = anchor - 1; c >= 0; c--) {
+      place(cols[c], (n) => { const s = ys(succ.get(n.id)); return s.length ? s : ys(pred.get(n.id)); });
+    }
+  }
 
-  const all = [...g.producers, ...g.topics, ...g.groups];
+  const columns = cols.map((nodes, i) => ({ x: i * (nodeW + gap), nodes }));
   const height = all.reduce((m, n) => Math.max(m, n._y + NODE_H), 0) + 12;
-  return { xs, gap, width: xs.group + NODE_W, height };
+  return { columns, width: columns.length ? columns[columns.length - 1].x + nodeW : 0, height };
+}
+
+function columnTitle(nodes) {
+  const kinds = new Set(nodes.map((n) => n.kind));
+  const names = [];
+  if (kinds.has("producer")) names.push("producers");
+  if (kinds.has("topic")) names.push("topics");
+  if (kinds.has("group")) names.push("consumer groups");
+  const t = names.join(" and ");
+  return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
 // ---------- rendering ----------
@@ -231,19 +307,17 @@ function linkWidth(rate) {
 function render() {
   const s = state.snap;
   const g = visibleGraph();
-  const { xs, width, height } = layout(g);
+  const { columns, width, height } = layout(g);
   const svg = els.svg;
 
   els.heads.style.width = width + "px";
-  const heads = els.heads.querySelectorAll("h2");
-  heads[0].style.left = xs.producer + "px";
-  heads[1].style.left = xs.topic + "px";
-  heads[2].style.left = xs.group + "px";
+  els.heads.innerHTML = columns.map((c) => `<h2 style="left:${c.x}px;max-width:${nodeW}px">${esc(columnTitle(c.nodes))}</h2>`).join("");
 
   if (!g.topics.length && !g.groups.length) {
     svg.setAttribute("width", 0);
     svg.setAttribute("height", 0);
     svg.innerHTML = "";
+    els.heads.innerHTML = "";
     state.animated = [];
     els.empty.hidden = false;
     els.empty.innerHTML = els.filter.value || els.hideIdle.checked
@@ -259,18 +333,16 @@ function render() {
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
 
   const pos = new Map();
-  for (const n of g.producers) pos.set(n.id, { x: xs.producer, y: n._y });
-  for (const n of g.topics) pos.set(n.id, { x: xs.topic, y: n._y });
-  for (const n of g.groups) pos.set(n.id, { x: xs.group, y: n._y });
+  for (const c of columns) for (const n of c.nodes) pos.set(n.id, { x: c.x, y: n._y });
 
   // Links first so nodes sit on top.
   let linkSvg = "";
   for (const l of g.links) {
     const a = pos.get(l.source), b = pos.get(l.target);
     if (!a || !b) continue;
-    const x1 = a.x + NODE_W, y1 = a.y + NODE_H / 2, x2 = b.x, y2 = b.y + NODE_H / 2;
-    const mx = (x1 + x2) / 2;
-    const d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+    const x1 = a.x + nodeW, y1 = a.y + NODE_H / 2, x2 = b.x, y2 = b.y + NODE_H / 2;
+    const bend = Math.max(70, Math.abs(x2 - x1) / 2);   // also draws loops when a link points back left
+    const d = `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
     const w = linkWidth(l.rate);
     const lagging = l.kind === "consume" && lagRising(l.id);
     const cls = `${l.kind}${lagging ? " lagging" : ""}`;
@@ -312,7 +384,7 @@ function labelOf(id) {
 function nodeShell(n, p, cls, title, body) {
   const selected = state.selected === n.id ? " selected" : "";
   return `<g class="node ${cls}${selected}" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})" tabindex="0" role="button" aria-label="${esc(title)}">`
-    + `<title>${esc(title)}</title><rect class="box" width="${NODE_W}" height="${NODE_H}" rx="7"/>${body}</g>`;
+    + `<title>${esc(title)}</title><rect class="box" width="${nodeW}" height="${NODE_H}" rx="7"/>${body}</g>`;
 }
 
 function producerNode(n, p) {
@@ -322,8 +394,8 @@ function producerNode(n, p) {
     : `<tspan class="rate-in">${fmtRate(n.rate)}</tspan>${n.topics.length > 1 ? ` into ${n.topics.length} topics` : ""}${idle ? `, last write ${ago(n.lastSeenMs)}` : ""}`;
   return nodeShell(n, p, `producer${n.synthetic ? " synthetic" : ""}${idle ? " idle" : ""}`,
     `${n.label}: ${fmtRate(n.rate)}`,
-    `<line class="accent" x1="${NODE_W - 1.5}" y1="12" x2="${NODE_W - 1.5}" y2="${NODE_H - 12}"/>`
-    + `<text class="name" x="14" y="21">${esc(clip(n.label, 27))}</text>`
+    `<line class="accent" x1="${nodeW - 1.5}" y1="12" x2="${nodeW - 1.5}" y2="${NODE_H - 12}"/>`
+    + `<text class="name" x="14" y="21">${esc(clip(n.label, fit(28)))}</text>`
     + `<text class="sub" x="14" y="39">${sub}</text>`);
 }
 
@@ -331,50 +403,58 @@ function topicNode(n, p) {
   const idle = n.inRate === 0 && n.outRate === 0;
   return nodeShell(n, p, `topic${idle ? " idle" : ""}`,
     `${n.name}: ${fmtRate(n.inRate)} in, ${fmtRate(n.outRate)} out, ${n.partitions} partitions`,
-    `<text class="name" x="14" y="21">${esc(clip(n.name, 22))}</text>`
-    + `<text class="sub" x="${NODE_W - 12}" y="21" text-anchor="end">${n.partitions}p</text>`
+    `<text class="name" x="14" y="21">${esc(clip(n.name, fit(64)))}</text>`
+    + `<text class="sub" x="${nodeW - 12}" y="21" text-anchor="end">${n.partitions}p</text>`
     + `<text class="sub" x="14" y="39"><tspan class="rate-in">${fmtRate(n.inRate)}</tspan> in   `
     + `<tspan class="rate-out">${fmtRate(n.outRate)}</tspan> out</text>`
-    + `<text class="sub" x="${NODE_W - 12}" y="39" text-anchor="end">${fmtNum(n.messages)} msgs</text>`);
+    + `<text class="sub" x="${nodeW - 12}" y="39" text-anchor="end">${fmtNum(n.messages)} msgs</text>`);
 }
 
 function groupNode(n, p) {
   const rising = lagRising(n.id);
-  const idle = n.rate === 0 && !(n.lag > 0);
+  const relay = n.outputTopics.length > 0;
+  const idle = n.rate === 0 && !(n.lag > 0) && !(n.produceRate > 0);
   const lagText = n.lag > 0 ? `lag ${fmtNum(n.lag)}${rising ? " ↑" : ""}` : "no lag";
   const members = n.members.length;
-  return nodeShell(n, p, `group${idle ? " idle" : ""}`,
-    `${n.groupId}: ${fmtRate(n.rate)}, ${lagText}, ${members} members, ${n.state}`,
+  const memberText = members ? members + (members === 1 ? " member" : " members") : n.state.toLowerCase();
+  // A processor shows what it reads and writes; its lag moves to the top right.
+  const corner = relay ? `<tspan class="${rising ? "lag" : ""}">${lagText}</tspan>` : memberText;
+  const sub = relay
+    ? `<tspan class="rate-out">${fmtRate(n.rate)}</tspan> in   <tspan class="rate-in">${fmtRate(n.produceRate)}</tspan> out`
+    : `<tspan class="rate-out">${fmtRate(n.rate)}</tspan>   <tspan class="${rising ? "lag" : ""}">${lagText}</tspan>`;
+  return nodeShell(n, p, `group${relay ? " relay" : ""}${idle ? " idle" : ""}`,
+    `${n.groupId}: ${fmtRate(n.rate)} consumed${relay ? `, ${fmtRate(n.produceRate)} produced` : ""}, ${lagText}, ${memberText}, ${n.state}`,
     `<line class="accent" x1="1.5" y1="12" x2="1.5" y2="${NODE_H - 12}"/>`
-    + `<text class="name" x="14" y="21">${esc(clip(n.groupId, 18))}</text>`
-    + `<text class="sub" x="${NODE_W - 12}" y="21" text-anchor="end">${members ? members + (members === 1 ? " member" : " members") : n.state.toLowerCase()}</text>`
-    + `<text class="sub" x="14" y="39"><tspan class="rate-out">${fmtRate(n.rate)}</tspan>   `
-    + `<tspan class="${rising ? "lag" : ""}">${lagText}</tspan></text>`);
+    + (relay ? `<line class="accent out" x1="${nodeW - 1.5}" y1="12" x2="${nodeW - 1.5}" y2="${NODE_H - 12}"/>` : "")
+    + `<text class="name" x="14" y="21">${esc(clip(n.groupId, fit(relay ? 96 : 100)))}</text>`
+    + `<text class="sub" x="${nodeW - 12}" y="21" text-anchor="end">${corner}</text>`
+    + `<text class="sub" x="14" y="39">${sub}</text>`);
 }
 
 // ---------- hover / selection highlighting ----------
 
+/** Highlights the whole lineage of the focused node: everything upstream and downstream of it. */
 function applyFocus() {
   const focus = state.hovered || state.selected;
   const svg = els.svg;
   svg.classList.toggle("focusing", !!focus);
   svg.querySelectorAll(".hl").forEach((e) => e.classList.remove("hl"));
   if (!focus) return;
-  const related = new Set([focus]);
-  // Follow the flow one hop each way, and through topics to the other side.
   const links = state.snap.links;
-  const near = links.filter((l) => l.source === focus || l.target === focus);
-  near.forEach((l) => { related.add(l.source); related.add(l.target); });
-  const node = state.nodes.get(focus);
-  const hlLinks = new Set(near.map((l) => l.source + " " + l.target));
-  if (node && node.kind === "topic") {
-    // already complete
-  } else {
-    // a producer/group: also show the other side of the topics it touches
-    const topics = near.map((l) => (l.kind === "produce" ? l.target : l.source));
-    for (const l of links) {
-      const t = l.kind === "produce" ? l.target : l.source;
-      if (topics.includes(t)) { related.add(l.source); related.add(l.target); hlLinks.add(l.source + " " + l.target); }
+  const related = new Set([focus]);
+  const hlLinks = new Set();
+  for (const forward of [true, false]) {
+    const queue = [focus];
+    const seen = new Set(queue);
+    while (queue.length) {
+      const id = queue.shift();
+      for (const l of links) {
+        const from = forward ? l.source : l.target, to = forward ? l.target : l.source;
+        if (from !== id) continue;
+        hlLinks.add(l.source + " " + l.target);
+        related.add(to);
+        if (!seen.has(to)) { seen.add(to); queue.push(to); }
+      }
     }
   }
   svg.querySelectorAll(".node").forEach((e) => { if (related.has(e.dataset.id)) e.classList.add("hl"); });
@@ -457,12 +537,17 @@ function renderDetail() {
   } else if (n.kind === "group") {
     const ins = links.filter((l) => l.target === id).sort((a, b) => b.rate - a.rate);
     const rising = lagRising(id);
-    html = head("Consumer group", n.groupId, `<span class="pill${n.state === "STABLE" ? "" : " bad"}">${esc(n.state.toLowerCase())}</span>`)
-      + stats([["Consuming", fmtRate(n.rate)], ["Lag", fmtNum(n.lag) + (rising ? " ↑" : "")], ["Members", n.members.length], ["Topics", n.topics.length]])
+    const outs = links.filter((l) => l.source === id).sort((a, b) => b.rate - a.rate);
+    const relay = n.outputTopics.length > 0;
+    html = head(relay ? "Consumer group, writes downstream" : "Consumer group", n.groupId, `<span class="pill${n.state === "STABLE" ? "" : " bad"}">${esc(n.state.toLowerCase())}</span>`)
+      + stats([["Consuming", fmtRate(n.rate)], ...(relay ? [["Producing", fmtRate(n.produceRate)]] : []),
+        ["Lag", fmtNum(n.lag) + (rising ? " ↑" : "")], ["Members", n.members.length]])
       + sparkline(id, "rate", cConsume)
       + sparkline(id, "lag", cLag)
-      + "<h4>Topics</h4>" + linkList(ins.map((l) => ({ id: l.source, label: labelOf(l.source), value: `${fmtRate(l.rate)}, lag ${fmtNum(l.lag)}` })),
+      + "<h4>Reads from</h4>" + linkList(ins.map((l) => ({ id: l.source, label: labelOf(l.source), value: `${fmtRate(l.rate)}, lag ${fmtNum(l.lag)}` })),
         "This group has no committed offsets on the visible topics.")
+      + (relay ? "<h4>Writes to</h4>" + linkList(outs.map((l) => ({ id: l.target, label: labelOf(l.target), value: fmtRate(l.rate) })), "No recent writes.")
+        + `<p class="note">Linked through producer ${n.producerIds.length > 1 ? "ids" : "id"} ${esc(n.producerIds.join(", "))}, whose transactional id starts with this group id.</p>` : "")
       + "<h4>Members</h4>" + (n.members.length
         ? "<ul>" + n.members.map((m) => `<li><span>${esc(m.clientId)}<br><small class="num">${esc(m.host)}</small></span><span class="num">${m.partitions} part.</span></li>`).join("") + "</ul>"
         : `<p class="note">No active members. Committed offsets are kept, so lag still shows what is waiting.</p>`);
