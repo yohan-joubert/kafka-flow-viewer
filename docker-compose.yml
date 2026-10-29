@@ -1,0 +1,7 @@
+# Single-node Kafka (KRaft) on localhost:9092 for trying the viewer.
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: kafka-flow-dev
+    ports:
+      - "9092:9092"

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kafka Flow Viewer</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&display=swap">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="identity">
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M4 9h9c5 0 6 14 11 14h4M4 23h9c5 0 6-14 11-14h4" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
+      <div>
+        <h1 id="cluster-name">Connecting…</h1>
+        <p id="cluster-meta" class="meta">Waiting for the first sample</p>
+      </div>
+    </div>
+    <dl class="totals" aria-live="polite">
+      <div><dt>Produced</dt><dd id="total-in">–</dd></div>
+      <div><dt>Consumed</dt><dd id="total-out">–</dd></div>
+      <div><dt>Total lag</dt><dd id="total-lag">–</dd></div>
+    </dl>
+    <div class="controls">
+      <label class="search">
+        <span class="sr-only">Filter by name</span>
+        <input id="filter" type="search" placeholder="Filter topics, groups, producers" autocomplete="off">
+      </label>
+      <label class="toggle"><input id="hide-idle" type="checkbox"> Hide idle</label>
+      <span id="live" class="live" title="Connection status"><span class="dot"></span><span id="live-text">Connecting</span></span>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="stage">
+    <div class="canvas" id="canvas">
+      <div class="columns" id="column-heads">
+        <h2>Producers</h2><h2>Topics</h2><h2>Consumer groups</h2>
+      </div>
+      <svg id="graph" role="img" aria-label="Flow of messages from producers through topics to consumer groups"></svg>
+      <div id="empty" class="empty" hidden></div>
+    </div>
+    <aside id="detail" class="detail" hidden aria-live="polite"></aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
