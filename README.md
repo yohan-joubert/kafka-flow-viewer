@@ -33,8 +33,12 @@ exactly-once consume-process-produce. Don't run it against production.
 
 ## Using the UI
 
-- **Hover** a node to highlight its lineage, everything upstream and downstream of it; **click** it for details: rate and lag history,
-  per-topic breakdown, group members with their client id, host and partition count.
+- **Hover** a node to highlight its lineage, everything upstream and downstream of it.
+- **Click** a node to expand it in place with **msg/s per partition**, which shows skew, idle partitions and where
+  lag sits. A topic lists in/s, out/s and lag per partition. A consumer group lists each partition's rate, lag and
+  the member that owns it. A producer lists the partitions it writes to, and a processing step lists both. Lag
+  that keeps growing on a partition turns red. Topics with more than 24 partitions show the 24 busiest. Clicking
+  also opens the details panel with rate and lag history and the group's members. Click again or press Esc to close.
 - **Filter** matches topic, group and producer names; a topic is shown if it, or anything connected to it, matches.
 - **Hide idle** removes topics with no traffic in or out.
 - Link thickness and particle speed follow the rate (log scale). Dotted grey links carry nothing right now.
@@ -68,7 +72,7 @@ exponential moving average (`rate.smoothing`).
 | Topic in-rate | growth of each partition's end offset (`listOffsets`) |
 | Group consume rate | growth of the group's committed offsets (`listConsumerGroupOffsets`) |
 | Lag | end offset − committed offset, summed over partitions |
-| Group members | `describeConsumerGroups`: client id, host, assigned partitions |
+| Group members | `describeConsumerGroups`: client id, host, assigned partitions (also the owner shown per partition) |
 | Producers and their rate | `describeProducers` (KIP-664): each producer's last sequence number per partition, which grows by one per record |
 | Producer names | transactional id via `listTransactions`, when the producer has one |
 | Group → producer (chains) | transactional id starting with the group id, see [Processing chains](#processing-chains) |
@@ -127,6 +131,7 @@ kafka.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule r
 |---|---|
 | `GET /api/snapshot` | latest snapshot as JSON |
 | `GET /api/stream` | `text/event-stream`, one `snapshot` event per poll |
+| `GET /api/partitions?node=t:orders` | per-partition rates for one node (`t:` topic, `g:` group, `p:` producer id) |
 
 Useful if you want to feed the same data into another tool.
 

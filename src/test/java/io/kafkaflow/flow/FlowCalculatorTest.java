@@ -22,7 +22,7 @@ class FlowCalculatorTest {
         return new ClusterSample(t, "c1", 1,
                 Map.of("orders", new TopicSample("orders", 2, 1, Map.of(0, end0, 1, end1))),
                 List.of(new GroupSample("billing", "STABLE",
-                        List.of(new MemberSample("m1", "billing-1", "/10.0.0.1", Set.of("orders"), 2)),
+                        List.of(new MemberSample("m1", "billing-1", "/10.0.0.1", Set.of("orders"), 2, Set.of(p0, p1))),
                         Map.of(p0, committed0, p1, committed1))),
                 List.of(new ProducerSample(7, epoch, p0, seq, t, null)),
                 List.of());
@@ -47,6 +47,37 @@ class FlowCalculatorTest {
         assertTrue(unidentified.synthetic());
         assertEquals(150.0, unidentified.rate(), 1e-9);
         assertEquals(3, s.links().size()); // producer 7, unidentified, billing
+    }
+
+    @Test
+    void partitionRatesShowSkewAndOwnership() {
+        FlowCalculator calc = new FlowCalculator(0);
+        calc.update(sample(0, 100, 100, 90, 100, 9, 0), "test", 1000);
+        // Partition 0 gets 300 messages, partition 1 gets 100; only partition 0 is consumed.
+        calc.update(sample(2000, 400, 200, 290, 100, 109, 0), "test", 1000);
+
+        List<FlowSnapshot.PartitionRate> topic = calc.partitions().get("t:orders");
+        assertEquals(2, topic.size());
+        assertEquals(150.0, topic.get(0).rate(), 1e-9);
+        assertEquals(50.0, topic.get(1).rate(), 1e-9);
+        assertEquals(100.0, topic.get(0).outRate(), 1e-9);
+        assertEquals(110, topic.get(0).lag());
+        assertEquals(100, topic.get(1).lag());
+
+        List<FlowSnapshot.PartitionRate> group = calc.partitions().get("g:billing");
+        assertEquals("billing-1", group.get(0).member());
+        assertEquals(100.0, group.get(0).rate(), 1e-9);
+        assertEquals(0.0, group.get(1).rate(), 1e-9);
+
+        List<FlowSnapshot.PartitionRate> producer = calc.partitions().get("p:7");
+        assertEquals(1, producer.size());
+        assertEquals(50.0, producer.get(0).rate(), 1e-9);
+
+        // Unattributed traffic per partition: 150 - 50 on p0, 50 on p1.
+        List<FlowSnapshot.PartitionRate> residual = calc.partitions().get(FlowCalculator.UNIDENTIFIED);
+        assertEquals(2, residual.size());
+        assertEquals(100.0, residual.get(0).rate(), 1e-9);
+        assertEquals(50.0, residual.get(1).rate(), 1e-9);
     }
 
     @Test

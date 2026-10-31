@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Set;
@@ -17,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -27,6 +29,7 @@ import java.util.function.Supplier;
  *   <li>{@code GET /}            the UI (static files from /web on the classpath)</li>
  *   <li>{@code GET /api/snapshot} latest snapshot as JSON</li>
  *   <li>{@code GET /api/stream}   text/event-stream, one "snapshot" event per poll</li>
+ *   <li>{@code GET /api/partitions?node=t:orders} per-partition rates of one node, from the latest poll</li>
  * </ul>
  */
 public final class WebServer implements AutoCloseable {
@@ -41,14 +44,18 @@ public final class WebServer implements AutoCloseable {
 
     private final HttpServer server;
     private final Supplier<String> latestJson;
+    private final Function<String, String> partitionsJson;
     private final Set<BlockingQueue<String>> subscribers = ConcurrentHashMap.newKeySet();
 
-    public WebServer(String host, int port, Supplier<String> latestJson) throws IOException {
+    public WebServer(String host, int port, Supplier<String> latestJson, Function<String, String> partitionsJson)
+            throws IOException {
         this.latestJson = latestJson;
+        this.partitionsJson = partitionsJson;
         this.server = HttpServer.create(new InetSocketAddress(host, port), 64);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.createContext("/api/snapshot", this::snapshot);
         server.createContext("/api/stream", this::stream);
+        server.createContext("/api/partitions", this::partitions);
         server.createContext("/", this::staticFile);
     }
 
@@ -75,6 +82,27 @@ public final class WebServer implements AutoCloseable {
     private void snapshot(HttpExchange ex) throws IOException {
         String json = latestJson.get();
         byte[] body = (json == null ? "{}" : json).getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        ex.getResponseHeaders().set("Cache-Control", "no-store");
+        ex.sendResponseHeaders(200, body.length);
+        try (OutputStream os = ex.getResponseBody()) {
+            os.write(body);
+        }
+    }
+
+    private void partitions(HttpExchange ex) throws IOException {
+        String node = null;
+        String query = ex.getRequestURI().getRawQuery();
+        if (query != null) {
+            for (String kv : query.split("&")) {
+                if (kv.startsWith("node=")) node = URLDecoder.decode(kv.substring(5), StandardCharsets.UTF_8);
+            }
+        }
+        if (node == null || node.isBlank()) {
+            send(ex, 400, "Missing ?node=");
+            return;
+        }
+        byte[] body = partitionsJson.apply(node).getBytes(StandardCharsets.UTF_8);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         ex.getResponseHeaders().set("Cache-Control", "no-store");
         ex.sendResponseHeaders(200, body.length);

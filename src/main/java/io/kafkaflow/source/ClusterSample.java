@@ -30,7 +30,9 @@ public record ClusterSample(
             Map<Tp, Long> committedOffsets
     ) {}
 
-    public record MemberSample(String memberId, String clientId, String host, Set<String> topics, int partitions) {}
+    /** {@code assignment} lists the partitions this member currently owns. */
+    public record MemberSample(String memberId, String clientId, String host, Set<String> topics, int partitions,
+                               Set<Tp> assignment) {}
 
     /**
      * One producer's state on one partition, as returned by describeProducers.

@@ -5,6 +5,8 @@
 const nodeW = 236;
 const NODE_H = 50;
 const ROW = 62;
+const PART_ROW = 17;                // one partition line inside an expanded node
+const PART_MAX = 24;                // more partitions than this: show the busiest
 const HISTORY = 150;               // samples kept per node (5 min at the default 2 s interval)
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -35,6 +37,7 @@ const state = {
   lastMessageAt: 0,
   animated: [],          // [{el, speed, id}]
   offsets: new Map(),    // link id -> current dash offset, survives re-renders
+  parts: null,           // {node, rows} per-partition rates of the selected node, from /api/partitions
 };
 
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -109,10 +112,11 @@ function ingest(snap) {
   for (const p of snap.producers) state.nodes.set(p.id, { ...p, kind: "producer" });
   for (const x of snap.topics) state.nodes.set(x.id, { ...x, kind: "topic" });
   for (const g of snap.groups) state.nodes.set(g.id, { ...g, kind: "group" });
-  if (state.selected && !state.nodes.has(state.selected)) state.selected = null;
+  if (state.selected && !state.nodes.has(state.selected)) { state.selected = null; state.parts = null; }
   renderHeader();
   render();
   renderDetail();
+  if (state.selected && !snap.error) fetchPartitions(state.selected);
 }
 
 // ---------- header ----------
@@ -235,6 +239,136 @@ function columnsOf(g) {
   return { cols, succ, pred };
 }
 
+// ---------- expanded node: per-partition rows ----------
+
+/** Lines drawn inside the selected node: section/topic headings and partition rows. */
+function partitionLines(n) {
+  if (state.selected !== n.id) return null;
+  const parts = state.parts && state.parts.node === n.id ? state.parts.rows : null;
+  if (!parts) return [{ type: "note", text: "Loading partitions…" }];
+  if (!parts.length) {
+    return [{ type: "note", text: n.kind === "group" ? "No committed offsets yet." : "No partition data." }];
+  }
+  let rows = parts;
+  let hidden = 0;
+  if (rows.length > PART_MAX) {
+    const keep = new Set([...rows].sort((a, b) => (b.rate + b.outRate) - (a.rate + a.outRate) || b.lag - a.lag).slice(0, PART_MAX));
+    hidden = rows.length - PART_MAX;
+    rows = rows.filter((r) => keep.has(r));
+  }
+  const lines = [];
+  const roles = [...new Set(rows.map((r) => r.role))];
+  const topics = new Set(rows.map((r) => r.role + "/" + r.topic));
+  const multiTopic = n.kind !== "topic" && topics.size > 1;
+  let lastRole = null, lastTopic = null;
+  for (const r of rows) {
+    if (r.role !== lastRole) {
+      lastRole = r.role;
+      lastTopic = null;
+      lines.push({ type: "head", role: r.role, withRole: roles.length > 1 });
+    }
+    if ((multiTopic || (roles.length > 1 && n.kind === "group")) && r.topic !== lastTopic) {
+      lastTopic = r.topic;
+      lines.push({ type: "topic", text: r.topic });
+    }
+    lines.push({ type: "row", row: r });
+  }
+  if (hidden) lines.push({ type: "note", text: `${PART_MAX} busiest of ${parts.length} partitions shown` });
+  return lines;
+}
+
+function heightOf(n) {
+  const lines = partitionLines(n);
+  return lines ? NODE_H + 6 + lines.length * PART_ROW + 8 : NODE_H;
+}
+
+function partitionSvg(n, lines) {
+  const rows = lines.filter((l) => l.type === "row").map((l) => l.row);
+  const max = Math.max(1e-9, ...rows.map((r) => r.rate));
+  const shortName = ownerNames(rows.map((r) => r.member).filter(Boolean));
+  const x0 = 12, x1 = nodeW - 12, barW = x1 - x0;
+  let y = NODE_H + 4;
+  let out = `<line class="part-rule" x1="${x0}" y1="${NODE_H}" x2="${x1}" y2="${NODE_H}"/>`;
+  for (const l of lines) {
+    const base = y + PART_ROW - 5;
+    if (l.type === "note") {
+      out += `<text class="part-note" x="${x0 + 2}" y="${base}">${esc(l.text)}</text>`;
+    } else if (l.type === "topic") {
+      out += `<text class="part-topic" x="${x0 + 2}" y="${base}">${esc(clip(l.text, fit(30)))}</text>`;
+    } else if (l.type === "head") {
+      const title = { topic: "Partition", read: l.withRole ? "Reads" : "Partition", write: l.withRole ? "Writes" : "Partition" }[l.role];
+      out += `<text class="part-head" x="${x0 + 2}" y="${base}">${title}</text>`;
+      if (l.role === "topic") {
+        out += `<text class="part-head" x="${x1 - 104}" y="${base}" text-anchor="end">in/s</text>`
+          + `<text class="part-head" x="${x1 - 52}" y="${base}" text-anchor="end">out/s</text>`
+          + `<text class="part-head" x="${x1 - 2}" y="${base}" text-anchor="end">lag</text>`;
+      } else if (l.role === "read") {
+        out += `<text class="part-head" x="${x0 + 30}" y="${base}">owner</text>`
+          + `<text class="part-head" x="${x1 - 52}" y="${base}" text-anchor="end">msg/s</text>`
+          + `<text class="part-head" x="${x1 - 2}" y="${base}" text-anchor="end">lag</text>`;
+      } else {
+        out += `<text class="part-head" x="${x1 - 2}" y="${base}" text-anchor="end">msg/s</text>`;
+      }
+    } else {
+      const r = l.row;
+      const key = `${n.id}#${r.role}#${r.topic}#${r.partition}`;
+      const rising = r.role !== "write" && lagRising(key);
+      const w = (r.rate / max) * barW;                 // bar = write rate (topic, producer) or read rate (group)
+      const tip = r.role === "topic"
+        ? `${r.topic} partition ${r.partition}: ${fmtRate(r.rate)} in, ${fmtRate(r.outRate)} out, lag ${fmtNum(r.lag)}, end offset ${fmtNum(r.offset)}`
+        : r.role === "read"
+          ? `${r.topic} partition ${r.partition}: ${fmtRate(r.rate)}, lag ${fmtNum(r.lag)}${r.member ? `, owned by ${r.member}` : ", unassigned"}`
+          : `${r.topic} partition ${r.partition}: ${fmtRate(r.rate)} written`;
+      out += `<g class="part${r.rate === 0 && r.outRate === 0 ? " zero" : ""}"><title>${esc(tip)}</title>`
+        + `<rect class="part-bar ${r.role}" x="${x0}" y="${y + 2}" width="${Math.max(w, 0).toFixed(1)}" height="${PART_ROW - 3}" rx="2"/>`
+        + `<text class="part-p" x="${x0 + 4}" y="${base}">${r.partition}</text>`;
+      if (r.role === "topic") {
+        out += `<text class="part-v in" x="${x1 - 104}" y="${base}" text-anchor="end">${fmtNum(r.rate)}</text>`
+          + `<text class="part-v out" x="${x1 - 52}" y="${base}" text-anchor="end">${fmtNum(r.outRate)}</text>`
+          + `<text class="part-v${rising ? " lag" : ""}" x="${x1 - 2}" y="${base}" text-anchor="end">${fmtNum(r.lag)}${rising ? " ↑" : ""}</text>`;
+      } else if (r.role === "read") {
+        const short = r.member ? shortName(r.member) : "unassigned";
+        const owner = short.length > 13 ? "…" + short.slice(-12) : short;   // the end is what tells members apart
+        out += `<text class="part-m" x="${x0 + 30}" y="${base}">${esc(owner)}</text>`
+          + `<text class="part-v out" x="${x1 - 52}" y="${base}" text-anchor="end">${fmtNum(r.rate)}</text>`
+          + `<text class="part-v${rising ? " lag" : ""}" x="${x1 - 2}" y="${base}" text-anchor="end">${fmtNum(r.lag)}${rising ? " ↑" : ""}</text>`;
+      } else {
+        out += `<text class="part-v in" x="${x1 - 2}" y="${base}" text-anchor="end">${fmtNum(r.rate)}</text>`;
+      }
+      out += "</g>";
+    }
+    y += PART_ROW;
+  }
+  return out;
+}
+
+/**
+ * Member client ids usually share a long prefix ("consumer-inventory-sync-1", "...-2"). Drop the shared part,
+ * keeping the last word before the difference, so rows read "sync-1", "sync-2". Full names are in tooltips.
+ */
+function ownerNames(names) {
+  const uniq = [...new Set(names)];
+  if (uniq.length < 2) return (n) => n;
+  let prefix = uniq[0];
+  for (const n of uniq) while (!n.startsWith(prefix)) prefix = prefix.slice(0, -1);
+  const seps = [...prefix.matchAll(/[-_.]/g)].map((m) => m.index);
+  const cut = seps.length >= 2 ? seps[seps.length - 2] + 1 : 0;
+  return (n) => n.slice(cut);
+}
+
+async function fetchPartitions(id) {
+  try {
+    const res = await fetch("api/partitions?node=" + encodeURIComponent(id), { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (state.selected !== id) return;               // selection changed while fetching
+    const t = data.timestamp;
+    for (const r of data.partitions) remember(`${id}#${r.role}#${r.topic}#${r.partition}`, r.rate, r.lag, t);
+    state.parts = { node: id, rows: data.partitions };
+    render();
+  } catch (e) { /* next snapshot retries */ }
+}
+
 function place(nodes, anchorY) {
   const items = nodes.map((n) => {
     const ys = anchorY(n);
@@ -245,7 +379,7 @@ function place(nodes, anchorY) {
   for (const it of items) {
     const want = isFinite(it.want) ? it.want : next;
     it.n._y = Math.max(want, next);
-    next = it.n._y + ROW;
+    next = it.n._y + heightOf(it.n) + (ROW - NODE_H);
   }
   // Pull the column back up if it was pushed far below its anchors.
   if (items.length) {
@@ -273,7 +407,8 @@ function layout(g) {
   let anchor = cols.findIndex((c) => c.some((n) => n.kind === "topic"));
   if (anchor < 0) anchor = 0;
   cols[anchor].sort((x, y) => (x.kind === "topic" ? 0 : 1) - (y.kind === "topic" ? 0 : 1) || nameOf(x).localeCompare(nameOf(y)));
-  cols[anchor].forEach((n, i) => { n._y = i * ROW; });
+  let yAcc = 0;
+  for (const n of cols[anchor]) { n._y = yAcc; yAcc += heightOf(n) + (ROW - NODE_H); }
   for (let pass = 0; pass < 2; pass++) {
     for (let c = anchor + 1; c < cols.length; c++) {
       place(cols[c], (n) => { const p = ys(pred.get(n.id)); return p.length ? p : ys(succ.get(n.id)); });
@@ -284,7 +419,7 @@ function layout(g) {
   }
 
   const columns = cols.map((nodes, i) => ({ x: i * (nodeW + gap), nodes }));
-  const height = all.reduce((m, n) => Math.max(m, n._y + NODE_H), 0) + 12;
+  const height = all.reduce((m, n) => Math.max(m, n._y + heightOf(n)), 0) + 12;
   return { columns, width: columns.length ? columns[columns.length - 1].x + nodeW : 0, height };
 }
 
@@ -382,9 +517,11 @@ function labelOf(id) {
 }
 
 function nodeShell(n, p, cls, title, body) {
-  const selected = state.selected === n.id ? " selected" : "";
-  return `<g class="node ${cls}${selected}" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})" tabindex="0" role="button" aria-label="${esc(title)}">`
-    + `<title>${esc(title)}</title><rect class="box" width="${nodeW}" height="${NODE_H}" rx="7"/>${body}</g>`;
+  const lines = partitionLines(n);
+  const selected = lines ? " selected expanded" : "";
+  return `<g class="node ${cls}${selected}" data-id="${esc(n.id)}" transform="translate(${p.x},${p.y})" tabindex="0" role="button" aria-expanded="${lines ? "true" : "false"}" aria-label="${esc(title)}">`
+    + `<title>${esc(title)}</title><rect class="box" width="${nodeW}" height="${heightOf(n)}" rx="7"/>${body}`
+    + (lines ? partitionSvg(n, lines) : "") + `</g>`;
 }
 
 function producerNode(n, p) {
@@ -481,13 +618,14 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.se
 
 function select(id) {
   state.selected = id === state.selected ? null : id;
-  els.svg.querySelectorAll(".node.selected").forEach((e) => e.classList.remove("selected"));
-  if (state.selected) {
-    const el = els.svg.querySelector(`.node[data-id="${CSS.escape(state.selected)}"]`);
-    if (el) el.classList.add("selected");
-  }
-  applyFocus();
+  state.parts = null;
+  render();
   renderDetail();
+  if (state.selected) {
+    fetchPartitions(state.selected);
+    const el = els.svg.querySelector(`.node[data-id="${CSS.escape(state.selected)}"]`);
+    if (el && document.activeElement !== el && document.activeElement?.closest?.(".node")) el.focus({ preventScroll: true });
+  }
 }
 
 // ---------- detail panel ----------

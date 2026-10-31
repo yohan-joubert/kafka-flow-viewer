@@ -146,6 +146,24 @@ body {
 .node .lag { fill: var(--lag); font-weight: 600; }
 .node.idle .name { fill: var(--ink-soft); }
 .node.selected rect.box { stroke: var(--ink); stroke-width: 2; stroke-opacity: 1; }
+.node.expanded rect.box { fill: var(--surface); }
+
+/* per-partition rows inside the selected node */
+.part-rule { stroke: var(--line); stroke-width: 1; }
+.part-head { fill: var(--ink-soft); font-size: 11.5px; }
+.part-topic { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.part-note { fill: var(--ink-soft); font-size: 12px; }
+.part-p { fill: var(--ink); font-size: 12px; font-weight: 600; }
+.part-m { fill: var(--ink-soft); font-size: 11.5px; }
+.part-v { fill: var(--ink-soft); font-size: 12px; }
+.part-v.in { fill: var(--produce); font-weight: 600; }
+.part-v.out { fill: var(--consume); font-weight: 600; }
+.part-v.lag { fill: var(--lag); font-weight: 600; }
+.part-bar { opacity: .13; }
+.part-bar.topic, .part-bar.write { fill: var(--produce); }
+.part-bar.read { fill: var(--consume); }
+.part.zero .part-p, .part.zero .part-v { fill: var(--idle); }
+.part:hover .part-bar { opacity: .3; }
 .node:focus-visible { outline: none; }
 .node:focus-visible rect.box { stroke: var(--focus); stroke-width: 2.5; }
 

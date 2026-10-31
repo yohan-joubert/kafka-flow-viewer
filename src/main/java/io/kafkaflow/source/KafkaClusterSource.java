@@ -204,12 +204,13 @@ public final class KafkaClusterSource implements ClusterSource {
                 state = String.valueOf(d.state());
                 for (MemberDescription md : d.members()) {
                     Set<String> memberTopics = new TreeSet<>();
-                    int partitions = 0;
+                    Set<Tp> assigned = new HashSet<>();
                     for (TopicPartition tp : md.assignment().topicPartitions()) {
                         memberTopics.add(tp.topic());
-                        partitions++;
+                        assigned.add(new Tp(tp.topic(), tp.partition()));
                     }
-                    members.add(new MemberSample(md.consumerId(), md.clientId(), md.host(), memberTopics, partitions));
+                    members.add(new MemberSample(md.consumerId(), md.clientId(), md.host(), memberTopics,
+                            assigned.size(), assigned));
                 }
             }
             out.add(new GroupSample(id, state, members, committed));

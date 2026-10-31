@@ -3,6 +3,7 @@ package io.kafkaflow.flow;
 import io.kafkaflow.flow.FlowSnapshot.GroupView;
 import io.kafkaflow.flow.FlowSnapshot.Link;
 import io.kafkaflow.flow.FlowSnapshot.MemberView;
+import io.kafkaflow.flow.FlowSnapshot.PartitionRate;
 import io.kafkaflow.flow.FlowSnapshot.ProducerView;
 import io.kafkaflow.flow.FlowSnapshot.TopicView;
 import io.kafkaflow.flow.FlowSnapshot.Totals;
@@ -42,6 +43,7 @@ public final class FlowCalculator {
     private final double smoothing;
     private final Map<String, Double> smoothed = new HashMap<>();
     private ClusterSample previous;
+    private Map<String, List<PartitionRate>> partitions = Map.of();
 
     public FlowCalculator(double smoothing) {
         if (smoothing < 0 || smoothing >= 1) throw new IllegalArgumentException("rate.smoothing must be in [0, 1)");
@@ -249,6 +251,12 @@ public final class FlowCalculator {
         topics.sort(Comparator.comparing(TopicView::name));
         groups.sort(Comparator.comparing(GroupView::groupId));
 
+        Map<Long, String> producerOwner = new HashMap<>();
+        for (Map.Entry<String, List<ProducerView>> e : relays.entrySet()) {
+            for (ProducerView p : e.getValue()) producerOwner.put(p.producerId(), "g:" + e.getKey());
+        }
+        partitions = partitionRates(now, before, dt, prevGroups, prevProducers, producerOwner, seenKeys);
+
         smoothed.keySet().retainAll(seenKeys);
         previous = now;
 
@@ -256,6 +264,106 @@ public final class FlowCalculator {
                 before == null,
                 new Totals(totalIn, totalOut, totalLag, topics.size(), groups.size(), producers.size(), totalMessages),
                 topics, groups, producers, links, now.warnings(), null);
+    }
+
+    /** Per-partition numbers from the last {@link #update}, keyed by node id (t:..., g:..., p:...). */
+    public Map<String, List<PartitionRate>> partitions() {
+        return partitions;
+    }
+
+    private Map<String, List<PartitionRate>> partitionRates(ClusterSample now, ClusterSample before, double dt,
+                                                            Map<String, GroupSample> prevGroups,
+                                                            Map<String, ProducerSample> prevProducers,
+                                                            Map<Long, String> producerOwner, Set<String> seenKeys) {
+        boolean baseline = before != null;
+        Map<String, List<PartitionRate>> out = new HashMap<>();
+
+        // Topic partitions: write rate.
+        Map<Tp, Double> written = new HashMap<>();
+        for (TopicSample t : now.topics().values()) {
+            TopicSample prev = baseline ? before.topics().get(t.name()) : null;
+            for (Map.Entry<Integer, Long> e : t.endOffsets().entrySet()) {
+                Tp tp = new Tp(t.name(), e.getKey());
+                Long p = prev == null ? null : prev.endOffsets().get(e.getKey());
+                long delta = p != null && e.getValue() >= p ? e.getValue() - p : 0;
+                written.put(tp, rate("pt:" + t.name() + "\u0000" + tp.partition(), delta, dt, prev != null, seenKeys));
+            }
+        }
+
+        // Consumer groups: consume rate, lag, owning member.
+        Map<Tp, Double> consumed = new HashMap<>();
+        Map<Tp, Long> lagged = new HashMap<>();
+        for (GroupSample g : now.groups()) {
+            GroupSample prev = prevGroups.get(g.groupId());
+            Map<Tp, String> owner = new HashMap<>();
+            for (MemberSample m : g.members()) {
+                if (m.assignment() != null) for (Tp tp : m.assignment()) owner.put(tp, m.clientId());
+            }
+            List<PartitionRate> rows = new ArrayList<>();
+            for (Map.Entry<Tp, Long> e : g.committedOffsets().entrySet()) {
+                Tp tp = e.getKey();
+                TopicSample topic = now.topics().get(tp.topic());
+                if (topic == null) continue;
+                Long end = topic.endOffsets().get(tp.partition());
+                long lag = end == null ? 0 : Math.max(0, end - e.getValue());
+                Long p = prev == null ? null : prev.committedOffsets().get(tp);
+                long delta = p != null && e.getValue() >= p ? e.getValue() - p : 0;
+                double r = rate("pc:" + g.groupId() + "\u0000" + tp.topic() + "\u0000" + tp.partition(), delta, dt,
+                        prev != null, seenKeys);
+                consumed.merge(tp, r, Double::sum);
+                lagged.merge(tp, lag, Long::sum);
+                rows.add(new PartitionRate(tp.topic(), tp.partition(), "read", r, 0, lag, e.getValue(), owner.get(tp)));
+            }
+            // Assigned partitions with no commit yet.
+            for (Map.Entry<Tp, String> e : owner.entrySet()) {
+                if (!g.committedOffsets().containsKey(e.getKey()) && now.topics().containsKey(e.getKey().topic())) {
+                    rows.add(new PartitionRate(e.getKey().topic(), e.getKey().partition(), "read", 0, 0, 0, -1, e.getValue()));
+                }
+            }
+            out.put("g:" + g.groupId(), rows);
+        }
+
+        for (TopicSample t : now.topics().values()) {
+            List<PartitionRate> rows = new ArrayList<>();
+            for (Map.Entry<Integer, Long> e : t.endOffsets().entrySet()) {
+                Tp tp = new Tp(t.name(), e.getKey());
+                rows.add(new PartitionRate(t.name(), e.getKey(), "topic", written.getOrDefault(tp, 0.0),
+                        consumed.getOrDefault(tp, 0.0), lagged.getOrDefault(tp, 0L), e.getValue(), null));
+            }
+            out.put("t:" + t.name(), rows);
+        }
+
+        // Producers: sequence growth per partition. Relay producers report under their group.
+        Map<Tp, Double> attributed = new HashMap<>();
+        for (ProducerSample p : now.producers()) {
+            ProducerSample prev = prevProducers.get(producerKey(p));
+            long delta = prev == null ? 0 : sequenceDelta(prev, p);
+            double r = rate("pp:" + producerKey(p), delta, dt, baseline, seenKeys);
+            attributed.merge(p.partition(), r, Double::sum);
+            String node = producerOwner.getOrDefault(p.producerId(), "p:" + p.producerId());
+            out.computeIfAbsent(node, k -> new ArrayList<>()).add(new PartitionRate(p.partition().topic(),
+                    p.partition().partition(), "write", r, 0, 0, p.lastSequence(), null));
+        }
+
+        // Whatever no identified producer explains.
+        List<PartitionRate> residual = new ArrayList<>();
+        for (Map.Entry<Tp, Double> e : written.entrySet()) {
+            double r = e.getValue() - attributed.getOrDefault(e.getKey(), 0.0);
+            if (r > Math.max(0.05, 0.05 * e.getValue())) {
+                residual.add(new PartitionRate(e.getKey().topic(), e.getKey().partition(), "write", r, 0, 0, -1, null));
+            }
+        }
+        if (!residual.isEmpty()) out.put(UNIDENTIFIED, residual);
+
+        Comparator<PartitionRate> order = Comparator.comparing(PartitionRate::role)
+                .thenComparing(PartitionRate::topic).thenComparingInt(PartitionRate::partition);
+        Map<String, List<PartitionRate>> sorted = new HashMap<>();
+        for (Map.Entry<String, List<PartitionRate>> e : out.entrySet()) {
+            List<PartitionRate> rows = new ArrayList<>(e.getValue());
+            rows.sort(order);
+            sorted.put(e.getKey(), List.copyOf(rows));
+        }
+        return Map.copyOf(sorted);
     }
 
     /** The group a transactional producer belongs to by naming convention (longest matching group id), or null. */

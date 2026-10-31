@@ -12,6 +12,8 @@ import io.kafkaflow.web.WebServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -27,6 +29,8 @@ public final class KafkaFlowViewer {
     private final FlowCalculator calculator;
     private final AtomicReference<FlowSnapshot> latest = new AtomicReference<>();
     private final AtomicReference<String> latestJson = new AtomicReference<>();
+    private final AtomicReference<Map<String, List<FlowSnapshot.PartitionRate>>> partitions =
+            new AtomicReference<>(Map.of());
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "cluster-poller");
         t.setDaemon(true);
@@ -67,7 +71,7 @@ public final class KafkaFlowViewer {
     }
 
     public void start() throws Exception {
-        web = new WebServer(config.httpHost(), config.httpPort(), latestJson::get);
+        web = new WebServer(config.httpHost(), config.httpPort(), latestJson::get, this::partitionsJson);
         web.start();
         long interval = config.pollInterval().toMillis();
         scheduler.scheduleWithFixedDelay(this::pollOnce, 0, interval, TimeUnit.MILLISECONDS);
@@ -80,6 +84,7 @@ public final class KafkaFlowViewer {
             long t0 = System.nanoTime();
             ClusterSample sample = source.sample();
             snapshot = calculator.update(sample, source.describe(), interval);
+            partitions.set(calculator.partitions());
             long ms = (System.nanoTime() - t0) / 1_000_000;
             if (consecutiveFailures > 0) log.info("Connection to {} restored", source.describe());
             consecutiveFailures = 0;
@@ -104,6 +109,14 @@ public final class KafkaFlowViewer {
         String json = Json.write(snapshot);
         latestJson.set(json);
         web.publish(json);
+    }
+
+    private String partitionsJson(String node) {
+        FlowSnapshot s = latest.get();
+        return Json.write(Map.of(
+                "node", node,
+                "timestamp", s == null ? 0 : s.timestamp(),
+                "partitions", partitions.get().getOrDefault(node, List.of())));
     }
 
     private static String describeError(Throwable e) {

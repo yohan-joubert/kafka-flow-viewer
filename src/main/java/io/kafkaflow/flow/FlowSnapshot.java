@@ -66,6 +66,18 @@ public record FlowSnapshot(
             List<String> topics
     ) {}
 
+    /**
+     * One partition's numbers as seen from one node (served by /api/partitions, not part of the live stream).
+     * <ul>
+     *   <li>topic node, role "topic": rate = msg/s written, outRate = msg/s consumed by all groups,
+     *       lag = summed over groups, offset = end offset</li>
+     *   <li>group node, role "read": rate = msg/s consumed, lag, offset = committed offset, member = owner</li>
+     *   <li>producer node, or a group that writes, role "write": rate = msg/s written</li>
+     * </ul>
+     */
+    public record PartitionRate(String topic, int partition, String role, double rate, double outRate, long lag,
+                                long offset, String member) {}
+
     /** kind is "produce" (producer -> topic) or "consume" (topic -> group). lag is only set for consume links. */
     public record Link(String id, String source, String target, String kind, double rate, long lag) {}
 

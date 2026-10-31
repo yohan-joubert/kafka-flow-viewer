@@ -8,6 +8,7 @@ import io.kafkaflow.source.ClusterSample.Tp;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -204,13 +205,22 @@ public final class SimulatedClusterSource implements ClusterSource {
     private List<GroupSample> groupSamples() {
         List<GroupSample> out = new ArrayList<>();
         for (Group g : groups) {
+            // Round-robin assignment, like Kafka's RoundRobinAssignor.
+            List<Set<Tp>> assignments = new ArrayList<>();
+            for (int m = 0; m < g.members(); m++) assignments.add(new HashSet<>());
+            int next = 0;
+            for (String topic : g.topics()) {
+                for (Tp tp : partitions(topic)) {
+                    if (g.members() > 0) assignments.get(next++ % g.members()).add(tp);
+                }
+            }
             List<MemberSample> members = new ArrayList<>();
             for (int m = 0; m < g.members(); m++) {
-                Set<String> assigned = new TreeSet<>(g.topics());
-                int partitions = 0;
-                for (String topic : g.topics()) partitions += partitions(topic).size();
+                Set<String> assignedTopics = new TreeSet<>();
+                for (Tp tp : assignments.get(m)) assignedTopics.add(tp.topic());
                 members.add(new MemberSample("member-" + m, g.clientPrefix() + "-" + (m + 1),
-                        "/10.0.3." + (11 + m + g.id().length()), assigned, Math.max(1, partitions / g.members())));
+                        "/10.0.3." + (11 + m + g.id().length()), assignedTopics, assignments.get(m).size(),
+                        assignments.get(m)));
             }
             String state = g.members() == 0 ? "EMPTY" : "STABLE";
             out.add(new GroupSample(g.id(), state, members, new HashMap<>(committed.get(g.id()))));
