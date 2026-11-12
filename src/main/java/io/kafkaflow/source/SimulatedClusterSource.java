@@ -240,6 +240,97 @@ public final class SimulatedClusterSource implements ClusterSource {
         return out;
     }
 
+    // ---- sample message ----------------------------------------------------------------------
+
+    /**
+     * Builds a plausible message for the topic. The content is derived from (topic, partition, offset), so the
+     * same offset always shows the same message. Retention is pretended to keep the last ~40% of each partition.
+     */
+    @Override
+    public synchronized SampledMessage sampleMessage(String topic, int maxBytes) {
+        List<Tp> parts = partitions(topic);
+        Tp tp = parts.get(random.nextInt(parts.size()));
+        long last = endOffsets.get(tp) - 1;
+        long first = (long) (last * 0.6);
+        if (last < first) return null;
+        long offset = first + (long) (random.nextDouble() * (last - first + 1));
+        Random r = new Random((topic + "/" + tp.partition() + "/" + offset).hashCode());
+        long ts = System.currentTimeMillis() - (long) ((last - offset) * 1000.0 / 40) - r.nextInt(1000);
+
+        String id = Long.toString(100_000 + Math.abs(r.nextLong() % 900_000));
+        String sku = "SKU-" + (1000 + r.nextInt(9000));
+        String customer = "cus_" + Long.toString(Math.abs(r.nextLong()), 36).substring(0, 8);
+        String amount = String.format(java.util.Locale.ROOT, "%.2f", 5 + r.nextDouble() * 400);
+        String time = java.time.Instant.ofEpochMilli(ts).toString();
+        List<SampledMessage.Header> headers = new ArrayList<>();
+        headers.add(header("traceparent", "00-" + hex(r, 16) + "-" + hex(r, 8) + "-01", maxBytes));
+        String key = "order-" + id;
+        byte[] value;
+        switch (topic) {
+            case "orders" -> value = json("""
+                    {"orderId":"%s","customerId":"%s","createdAt":"%s","currency":"EUR","total":%s,                    "items":[{"sku":"%s","quantity":%d,"unitPrice":%s}],"channel":"%s"}""",
+                    id, customer, time, amount, sku, 1 + r.nextInt(4), amount, r.nextBoolean() ? "web" : "ios");
+            case "payments" -> value = json("""
+                    {"paymentId":"pay_%s","orderId":"%s","amount":%s,"currency":"EUR","method":"%s","status":"AUTHORIZED"}""",
+                    hex(r, 6), id, amount, r.nextBoolean() ? "card" : "paypal");
+            case "payments-verified" -> value = json("""
+                    {"paymentId":"pay_%s","orderId":"%s","riskScore":%.3f,"decision":"ACCEPT","checkedBy":"fraud-check"}""",
+                    hex(r, 6), id, r.nextDouble() * 0.3);
+            case "ledger-entries" -> value = json("""
+                    {"entryId":"le_%s","orderId":"%s","account":"%s","direction":"%s","amount":%s,"currency":"EUR"}""",
+                    hex(r, 6), id, r.nextBoolean() ? "receivables" : "revenue", r.nextBoolean() ? "DEBIT" : "CREDIT", amount);
+            case "shipments" -> value = json("""
+                    {"shipmentId":"shp_%s","orderId":"%s","carrier":"%s","status":"%s","eta":"%s"}""",
+                    hex(r, 6), id, r.nextBoolean() ? "colissimo" : "dhl", r.nextBoolean() ? "LABEL_CREATED" : "IN_TRANSIT",
+                    java.time.Instant.ofEpochMilli(ts + 86_400_000L * (1 + r.nextInt(4))).toString().substring(0, 10));
+            case "inventory-updates" -> {
+                key = sku;
+                value = json("""
+                        {"sku":"%s","warehouse":"%s","delta":%d,"onHand":%d,"at":"%s"}""",
+                        sku, r.nextBoolean() ? "PAR-1" : "LYS-2", -(1 + r.nextInt(5)), r.nextInt(800), time);
+            }
+            case "user-clicks" -> {
+                // Not text: shows how binary formats look. Confluent wire format: magic byte 0, schema id, Avro body.
+                key = null;
+                value = new byte[40 + r.nextInt(40)];
+                r.nextBytes(value);
+                value[0] = 0;
+                value[1] = 0; value[2] = 0; value[3] = 0; value[4] = 42;
+                headers.clear();
+            }
+            case "notifications" -> value = json("""
+                    {"to":"%s","template":"order-confirmation","orderId":"%s","locale":"fr-FR"}""", customer, id);
+            case "orders-dlq" -> {
+                value = json("""
+                        {"orderId":"%s","customerId":"%s","total":"%s EUR"}""", id, customer, amount);
+                headers.add(header("error.class", "com.fasterxml.jackson.databind.exc.InvalidFormatException", maxBytes));
+                headers.add(header("error.message", "Cannot deserialize value of type `java.math.BigDecimal` from String \"" + amount + " EUR\"", maxBytes));
+                headers.add(header("source.topic", "orders", maxBytes));
+            }
+            default -> value = json("""
+                    {"event":"%s","actor":"%s","at":"%s"}""", topic, customer, time);
+        }
+        headers.add(header("content-type", topic.equals("user-clicks") ? "application/vnd.kafka.avro.v2" : "application/json", maxBytes));
+        return new SampledMessage(topic, tp.partition(), offset, ts, "CreateTime",
+                key == null ? SampledMessage.Payload.NULL : SampledMessage.Payload.of(key.getBytes(java.nio.charset.StandardCharsets.UTF_8), maxBytes),
+                SampledMessage.Payload.of(value, maxBytes), headers, first, last);
+    }
+
+    private static byte[] json(String format, Object... args) {
+        return String.format(java.util.Locale.ROOT, format, args).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private static SampledMessage.Header header(String key, String value, int maxBytes) {
+        return new SampledMessage.Header(key,
+                SampledMessage.Payload.of(value.getBytes(java.nio.charset.StandardCharsets.UTF_8), Math.min(maxBytes, 2048)));
+    }
+
+    private static String hex(Random r, int bytes) {
+        byte[] b = new byte[bytes];
+        r.nextBytes(b);
+        return java.util.HexFormat.of().formatHex(b);
+    }
+
     private List<Tp> partitions(String topic) {
         for (Topic t : topics) {
             if (t.name().equals(topic)) {
@@ -248,6 +339,6 @@ public final class SimulatedClusterSource implements ClusterSource {
                 return l;
             }
         }
-        throw new IllegalArgumentException(topic);
+        throw new IllegalArgumentException("No topic named " + topic);
     }
 }

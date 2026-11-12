@@ -42,7 +42,10 @@
       <svg id="graph" role="img" aria-label="Flow of messages from producers through topics to consumer groups"></svg>
       <div id="empty" class="empty" hidden></div>
     </div>
-    <aside id="detail" class="detail" hidden aria-live="polite"></aside>
+    <aside id="detail" class="detail" hidden>
+      <div id="detail-main" aria-live="polite"></div>
+      <section id="detail-sample" class="sample" hidden aria-live="polite"></section>
+    </aside>
   </main>
 
   <script src="app.js"></script>

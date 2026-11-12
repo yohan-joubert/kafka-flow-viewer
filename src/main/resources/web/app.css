@@ -213,6 +213,39 @@ svg.focusing .link:not(.hl), svg.focusing .link-base:not(.hl) { opacity: .06; }
 .detail li button { font: inherit; background: none; border: 0; padding: 0; color: var(--ink); cursor: pointer; text-align: left; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
 .detail li button:hover { text-decoration-color: currentColor; }
 .detail p.note { font-size: 13px; color: var(--ink-soft); margin: 14px 0 0; }
+
+/* sample message */
+.sample { margin-top: 8px; }
+.sample h5 { font-size: 12.5px; font-weight: 600; color: var(--ink-soft); margin: 16px 0 6px; display: flex; justify-content: space-between; }
+.sample h5 .size { font-weight: 450; }
+.sample-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.action {
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer;
+  padding: 7px 12px; border-radius: 6px;
+  color: var(--surface); background: var(--produce); border: 1px solid var(--produce);
+}
+.action:hover:not(:disabled) { filter: brightness(1.08); }
+.action:disabled { opacity: .6; cursor: progress; }
+.action.quiet { color: var(--ink); background: transparent; border-color: var(--line); font-weight: 500; }
+.sample .note.problem { color: var(--lag); }
+.sample-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; margin: 16px 0 0; }
+.sample-meta dt { font-size: 12.5px; color: var(--ink-soft); }
+.sample-meta dd { margin: 0; font-size: 17px; font-weight: 600; }
+.sample-when { font-size: 13.5px; margin: 8px 0 0; }
+.sample-range { font-size: 12.5px; color: var(--ink-soft); margin: 2px 0 0; }
+.sample pre {
+  margin: 0; padding: 10px 12px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--line);
+  font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink);
+}
+.sample pre.sample-value { max-height: 340px; overflow: auto; }
+.sample pre.hex { word-spacing: -1px; }
+.sample pre.json { white-space: pre; overflow-wrap: normal; overflow: auto; }
+.sample-headers { margin: 0; }
+.sample-headers div { padding: 7px 0; border-top: 1px solid var(--line); }
+.sample-headers dt { font-size: 12.5px; color: var(--ink-soft); }
+.sample-headers dd { margin: 2px 0 0; font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 .pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px; background: var(--surface-2); color: var(--ink-soft); }
 .pill.bad { background: color-mix(in srgb, var(--lag) 16%, transparent); color: var(--lag); }
 

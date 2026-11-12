@@ -16,6 +16,8 @@ const els = {
   heads: document.getElementById("column-heads"),
   empty: document.getElementById("empty"),
   detail: document.getElementById("detail"),
+  detailMain: document.getElementById("detail-main"),
+  detailSample: document.getElementById("detail-sample"),
   banner: document.getElementById("banner"),
   name: document.getElementById("cluster-name"),
   meta: document.getElementById("cluster-meta"),
@@ -38,6 +40,7 @@ const state = {
   animated: [],          // [{el, speed, id}]
   offsets: new Map(),    // link id -> current dash offset, survives re-renders
   parts: null,           // {node, rows} per-partition rates of the selected node, from /api/partitions
+  sample: null,          // {topic, status: "loading"|"done", message|error} from /api/sample
 };
 
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -71,7 +74,9 @@ function ago(ms) {
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
   if (s < 5) return "just now";
   if (s < 90) return s + " s ago";
-  return Math.round(s / 60) + " min ago";
+  if (s < 90 * 60) return Math.round(s / 60) + " min ago";
+  if (s < 36 * 3600) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " days ago";
 }
 
 // ---------- history & lag trend ----------
@@ -619,6 +624,8 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.se
 function select(id) {
   state.selected = id === state.selected ? null : id;
   state.parts = null;
+  state.sample = null;
+  renderSample();
   render();
   renderDetail();
   if (state.selected) {
@@ -655,6 +662,7 @@ function renderDetail() {
   const id = state.selected;
   const n = id && state.nodes.get(id);
   if (!n) { els.detail.hidden = true; return; }
+  els.detailSample.hidden = n.kind !== "topic";
   const links = state.snap.links;
   const css = getComputedStyle(document.documentElement);
   const cProduce = css.getPropertyValue("--produce").trim();
@@ -701,7 +709,7 @@ function renderDetail() {
         ? `<p class="note">Messages that no identified producer accounts for. Kafka only reports idempotent and transactional producers (the default since Kafka 3.0 clients); older or non-idempotent clients land here.</p>`
         : `<p class="note">Kafka identifies producers by id, not by client.id. Set a transactional.id to see a readable name.</p>`);
   }
-  els.detail.innerHTML = html;
+  els.detailMain.innerHTML = html;
   els.detail.hidden = false;
 }
 
@@ -713,6 +721,107 @@ function head(kind, title, extra = "") {
 function stats(rows) {
   return `<dl class="stats">${rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>`;
 }
+
+// ---------- sample message ----------
+
+async function loadSample() {
+  const n = state.nodes.get(state.selected);
+  if (!n || n.kind !== "topic") return;
+  const topic = n.name;
+  state.sample = { topic, status: "loading", previous: state.sample?.message };
+  renderSample();
+  let result;
+  try {
+    const res = await fetch("api/sample?topic=" + encodeURIComponent(topic), { cache: "no-store" });
+    const data = res.ok ? await res.json() : { error: `The viewer answered ${res.status}.` };
+    result = data.error ? { error: data.error, empty: !!data.empty } : { message: data };
+  } catch (e) {
+    result = { error: "The viewer did not answer. Check that it is still running." };
+  }
+  if (state.sample?.topic !== topic) return;          // another node was selected meanwhile
+  state.sample = { topic, status: "done", ...result };
+  renderSample();
+}
+
+/** Pretty-prints JSON values; anything else is shown as it is. */
+function displayValue(p) {
+  if (p.encoding === "null") return null;
+  if (p.encoding === "text" && !p.truncated) {
+    const t = p.text.trim();
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try { return JSON.stringify(JSON.parse(t), null, 2); } catch (e) { /* not JSON */ }
+    }
+  }
+  return p.text;
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + " bytes";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+function payloadNote(p, what) {
+  if (p.encoding === "hex") {
+    return `${what} is binary (${fmtBytes(p.size)}), shown as hex${p.truncated ? ", first bytes only" : ""}. `
+      + `It may use a format like Avro or Protobuf that needs a schema to decode.`;
+  }
+  if (p.truncated) return `${what} cut for display: ${fmtBytes(p.size)} in total.`;
+  return "";
+}
+
+function renderSample() {
+  const box = els.detailSample;
+  const s = state.sample;
+  const busy = s?.status === "loading";
+  const shown = s?.message;
+  const label = busy ? "Reading…" : shown ? "Show another" : "Show a random message";
+  let html = `<h4>Sample message</h4>
+    <div class="sample-actions">
+      <button class="action" data-sample ${busy ? "disabled" : ""}>${label}</button>
+      ${shown && !busy ? `<button class="action quiet" data-copy>Copy value</button>` : ""}
+    </div>`;
+
+  if (!s) {
+    html += `<p class="note">Reads one message from a random partition and offset of this topic. Nothing is committed and no consumer group is created.</p>`;
+  } else if (s.error && !busy) {
+    html += `<p class="note${s.empty ? "" : " problem"}">${esc(s.error)}</p>`;
+  } else if (shown && !busy) {
+    const m = shown;
+    const when = m.timestampMs > 0 ? `${m.timestampType === "LogAppendTime" ? "Appended" : "Written"} ${ago(m.timestampMs)}, ${new Date(m.timestampMs).toLocaleString()}` : "No timestamp";
+    const value = displayValue(m.value);
+    html += `<dl class="sample-meta">
+        <div><dt>Partition</dt><dd>${m.partition}</dd></div>
+        <div><dt>Offset</dt><dd>${m.offset.toLocaleString()}</dd></div>
+      </dl>
+      <p class="sample-when">${esc(when)}</p>
+      <p class="sample-range">Picked from offsets ${m.earliestOffset.toLocaleString()} to ${m.latestOffset.toLocaleString()} of this partition.</p>
+      <h5>Key</h5>
+      ${m.key.encoding === "null" ? `<p class="note">No key</p>` : `<pre class="sample-key">${esc(m.key.text)}</pre>`}
+      ${payloadNote(m.key, "Key") ? `<p class="note">${payloadNote(m.key, "Key")}</p>` : ""}
+      <h5>Value <span class="size">${m.value.encoding === "null" ? "" : fmtBytes(m.value.size)}</span></h5>
+      ${value == null ? `<p class="note">No value (a tombstone, which deletes this key in a compacted topic)</p>` : `<pre class="sample-value${m.value.encoding === "hex" ? " hex" : value !== m.value.text ? " json" : ""}" tabindex="0">${esc(value)}</pre>`}
+      ${payloadNote(m.value, "Value") ? `<p class="note">${payloadNote(m.value, "Value")}</p>` : ""}
+      ${m.headers.length ? `<h5>Headers <span class="size">${m.headers.length}</span></h5><dl class="sample-headers">${m.headers.map((h) =>
+        `<div><dt>${esc(h.key)}</dt><dd>${h.value.encoding === "null" ? "null" : esc(h.value.text)}</dd></div>`).join("")}</dl>` : ""}`;
+  }
+  box.innerHTML = html;
+}
+
+els.detailSample.addEventListener("click", async (e) => {
+  if (e.target.closest("[data-sample]")) { loadSample(); return; }
+  const copy = e.target.closest("[data-copy]");
+  if (copy && state.sample?.message) {
+    const m = state.sample.message;
+    try {
+      await navigator.clipboard.writeText(displayValue(m.value) ?? "");
+      copy.textContent = "Copied";
+    } catch (err) {
+      copy.textContent = "Copy not allowed here";
+    }
+    setTimeout(() => { if (copy.isConnected) copy.textContent = "Copy value"; }, 1600);
+  }
+});
 
 els.detail.addEventListener("click", (e) => {
   if (e.target.closest("[data-close]")) { select(null); return; }

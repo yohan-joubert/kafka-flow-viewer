@@ -6,6 +6,7 @@ import io.kafkaflow.flow.FlowSnapshot;
 import io.kafkaflow.source.ClusterSample;
 import io.kafkaflow.source.ClusterSource;
 import io.kafkaflow.source.KafkaClusterSource;
+import io.kafkaflow.source.SampledMessage;
 import io.kafkaflow.source.SimulatedClusterSource;
 import io.kafkaflow.web.Json;
 import io.kafkaflow.web.WebServer;
@@ -71,7 +72,9 @@ public final class KafkaFlowViewer {
     }
 
     public void start() throws Exception {
-        web = new WebServer(config.httpHost(), config.httpPort(), latestJson::get, this::partitionsJson);
+        web = new WebServer(config.httpHost(), config.httpPort(), latestJson::get);
+        web.addQuery("/api/partitions", "node", this::partitionsJson);
+        web.addQuery("/api/sample", "topic", this::sampleJson);
         web.start();
         long interval = config.pollInterval().toMillis();
         scheduler.scheduleWithFixedDelay(this::pollOnce, 0, interval, TimeUnit.MILLISECONDS);
@@ -117,6 +120,38 @@ public final class KafkaFlowViewer {
                 "node", node,
                 "timestamp", s == null ? 0 : s.timestamp(),
                 "partitions", partitions.get().getOrDefault(node, List.of())));
+    }
+
+    /** One random message of a topic, or {"error": "..."} explaining why there is none. */
+    private String sampleJson(String topic) {
+        if (!config.sampleEnabled()) {
+            return Json.write(Map.of("error", "Message sampling is turned off (sample.enabled=false)."));
+        }
+        try {
+            SampledMessage m = source.sampleMessage(topic, config.sampleMaxBytes());
+            if (m == null) {
+                return Json.write(Map.of("empty", true,
+                        "error", "This topic has no messages to show: it is empty, or retention has deleted them."));
+            }
+            return Json.write(m);
+        } catch (Exception e) {
+            log.warn("Cannot sample a message from {}: {}", topic, e.toString());
+            return Json.write(Map.of("error", describeSampleError(topic, e)));
+        }
+    }
+
+    private static String describeSampleError(String topic, Exception e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            String name = t.getClass().getSimpleName();
+            if (t instanceof IllegalArgumentException) return t.getMessage();
+            if (name.contains("Authorization")) {
+                return "Not allowed to read " + topic + ". The viewer's user needs the Read ACL on this topic.";
+            }
+            if (name.equals("RecordDeserializationException") || name.equals("CorruptRecordException")) {
+                return "The message at the picked offset could not be read: " + t.getMessage();
+            }
+        }
+        return describeError(e);
     }
 
     private static String describeError(Throwable e) {

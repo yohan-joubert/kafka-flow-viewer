@@ -131,6 +131,8 @@ public final class AppConfig {
     public Pattern groupExclude() { return pattern("groups.exclude"); }
     public boolean producersEnabled() { return bool("producers.enabled"); }
     public Duration producerIdleTimeout() { return Duration.ofMillis(Long.parseLong(get("producers.idle.timeout.ms"))); }
+    public boolean sampleEnabled() { return bool("sample.enabled"); }
+    public int sampleMaxBytes() { return Integer.parseInt(get("sample.max.bytes")); }
     public double rateSmoothing() { return Double.parseDouble(get("rate.smoothing")); }
     public String configFile() { return props.getProperty("config.file"); }
 

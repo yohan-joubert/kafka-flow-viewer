@@ -4,7 +4,8 @@ A live view of what is flowing through a Kafka cluster: **producers → topics �
 second on every link, consumer lag, and a warning colour when a group's lag keeps growing.
 
 It is a small Java 21 app (one dependency: `kafka-clients`) that polls the cluster with the AdminClient and streams
-snapshots to a browser page over Server-Sent Events. It is read-only: it never produces, consumes or joins a group.
+snapshots to a browser page over Server-Sent Events. It never writes, never joins a consumer group and never commits offsets. It only reads message contents when you ask
+for a sample message.
 
 ![Kafka Flow Viewer](docs/screenshot.png)
 
@@ -41,6 +42,11 @@ exactly-once consume-process-produce. Don't run it against production.
   also opens the details panel with rate and lag history and the group's members. Click again or press Esc to close.
 - **Filter** matches topic, group and producer names; a topic is shown if it, or anything connected to it, matches.
 - **Hide idle** removes topics with no traffic in or out.
+- **Sample message**: in a topic's details panel, *Show a random message* reads one message from a random partition
+  at a random offset and shows its partition, offset, timestamp, key, value and headers. JSON is pretty-printed.
+  Binary values (Avro, Protobuf…) are shown as hex, and values over `sample.max.bytes` are cut. It reads through a
+  separate consumer with no group (manual assignment), so it joins no consumer group and commits nothing. It uses
+  `read_committed`, so messages from aborted transactions never show. Turn it off with `sample.enabled=false`.
 - Link thickness and particle speed follow the rate (log scale). Dotted grey links carry nothing right now.
   A consume link turns red when that group's lag on that topic has been trending up for the last ~10 samples.
 
@@ -108,6 +114,8 @@ client supports works. See [`kafka-flow.example.properties`](kafka-flow.example.
 | `topics.internal` | `false` | show `__consumer_offsets` and friends |
 | `producers.enabled` | `true` | turn producer discovery off |
 | `producers.idle.timeout.ms` | `60000` | hide producers silent for longer than this |
+| `sample.enabled` | `true` | allow *Show a random message* on topics |
+| `sample.max.bytes` | `65536` | longer keys and values are cut for display |
 
 Secured cluster example:
 
@@ -121,7 +129,7 @@ kafka.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule r
 ### ACLs for the viewer's principal
 
 - `Describe` on the cluster
-- `Describe` on topics (and `Read` on topics for producer discovery via `describeProducers`)
+- `Describe` on topics (and `Read` on topics for producer discovery via `describeProducers`, and to sample messages)
 - `Describe` on consumer groups
 - `Describe` on transactional ids (optional, only to name transactional producers)
 
@@ -132,6 +140,7 @@ kafka.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule r
 | `GET /api/snapshot` | latest snapshot as JSON |
 | `GET /api/stream` | `text/event-stream`, one `snapshot` event per poll |
 | `GET /api/partitions?node=t:orders` | per-partition rates for one node (`t:` topic, `g:` group, `p:` producer id) |
+| `GET /api/sample?topic=orders` | one random message of a topic, or `{"error": …}` |
 
 Useful if you want to feed the same data into another tool.
 
@@ -141,7 +150,8 @@ Useful if you want to feed the same data into another tool.
 src/main/java/io/kafkaflow/
   KafkaFlowViewer.java          entry point: poll loop + web server
   config/AppConfig.java         properties file + CLI flags
-  source/KafkaClusterSource     AdminClient sampling (offsets, groups, producers)
+  source/KafkaClusterSource     AdminClient sampling (offsets, groups, producers), sample messages
+  source/SampledMessage         one message made readable (text, JSON or hex)
   source/SimulatedClusterSource --demo data
   flow/FlowCalculator           counters -> rates, lag, links
   web/WebServer                 JDK HttpServer, static UI + SSE

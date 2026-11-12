@@ -5,6 +5,12 @@ public interface ClusterSource extends AutoCloseable {
 
     ClusterSample sample() throws Exception;
 
+    /**
+     * Reads one message picked at random from the topic (random non-empty partition, random offset in it).
+     * Returns null when the topic has no messages. May be called from any thread.
+     */
+    SampledMessage sampleMessage(String topic, int maxBytes) throws Exception;
+
     /** Short human description, shown in the UI header. */
     String describe();
 

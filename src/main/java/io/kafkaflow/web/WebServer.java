@@ -30,6 +30,10 @@ import java.util.function.Supplier;
  *   <li>{@code GET /api/snapshot} latest snapshot as JSON</li>
  *   <li>{@code GET /api/stream}   text/event-stream, one "snapshot" event per poll</li>
  *   <li>{@code GET /api/partitions?node=t:orders} per-partition rates of one node, from the latest poll</li>
+ *   <li>{@code GET /api/sample?topic=orders} one random message of a topic</li>
+ * </ul>
+ * The two query endpoints are registered by {@link io.kafkaflow.KafkaFlowViewer} through {@link #addQuery}.
+ * <ul>
  * </ul>
  */
 public final class WebServer implements AutoCloseable {
@@ -44,18 +48,14 @@ public final class WebServer implements AutoCloseable {
 
     private final HttpServer server;
     private final Supplier<String> latestJson;
-    private final Function<String, String> partitionsJson;
     private final Set<BlockingQueue<String>> subscribers = ConcurrentHashMap.newKeySet();
 
-    public WebServer(String host, int port, Supplier<String> latestJson, Function<String, String> partitionsJson)
-            throws IOException {
+    public WebServer(String host, int port, Supplier<String> latestJson) throws IOException {
         this.latestJson = latestJson;
-        this.partitionsJson = partitionsJson;
         this.server = HttpServer.create(new InetSocketAddress(host, port), 64);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.createContext("/api/snapshot", this::snapshot);
         server.createContext("/api/stream", this::stream);
-        server.createContext("/api/partitions", this::partitions);
         server.createContext("/", this::staticFile);
     }
 
@@ -90,25 +90,34 @@ public final class WebServer implements AutoCloseable {
         }
     }
 
-    private void partitions(HttpExchange ex) throws IOException {
-        String node = null;
-        String query = ex.getRequestURI().getRawQuery();
-        if (query != null) {
-            for (String kv : query.split("&")) {
-                if (kv.startsWith("node=")) node = URLDecoder.decode(kv.substring(5), StandardCharsets.UTF_8);
+    /**
+     * Adds {@code GET path?param=value}, answered with {@code handler.apply(value)} as JSON. Handlers may be slow
+     * (sampling reads from Kafka); each request runs on its own virtual thread.
+     */
+    public void addQuery(String path, String param, Function<String, String> handler) {
+        server.createContext(path, ex -> {
+            String value = queryParam(ex, param);
+            if (value == null || value.isBlank()) {
+                send(ex, 400, "Missing ?" + param + "=");
+                return;
             }
+            byte[] body = handler.apply(value).getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+            ex.getResponseHeaders().set("Cache-Control", "no-store");
+            ex.sendResponseHeaders(200, body.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(body);
+            }
+        });
+    }
+
+    private static String queryParam(HttpExchange ex, String name) {
+        String query = ex.getRequestURI().getRawQuery();
+        if (query == null) return null;
+        for (String kv : query.split("&")) {
+            if (kv.startsWith(name + "=")) return URLDecoder.decode(kv.substring(name.length() + 1), StandardCharsets.UTF_8);
         }
-        if (node == null || node.isBlank()) {
-            send(ex, 400, "Missing ?node=");
-            return;
-        }
-        byte[] body = partitionsJson.apply(node).getBytes(StandardCharsets.UTF_8);
-        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-        ex.getResponseHeaders().set("Cache-Control", "no-store");
-        ex.sendResponseHeaders(200, body.length);
-        try (OutputStream os = ex.getResponseBody()) {
-            os.write(body);
-        }
+        return null;
     }
 
     private void stream(HttpExchange ex) throws IOException {

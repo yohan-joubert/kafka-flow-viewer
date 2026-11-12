@@ -29,14 +29,20 @@ import org.apache.kafka.clients.admin.DescribeProducersResult.PartitionProducerS
 import org.apache.kafka.clients.admin.ProducerState;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.admin.TransactionListing;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.KafkaFuture;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.TopicPartitionInfo;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -44,11 +50,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 /**
@@ -77,6 +85,11 @@ public final class KafkaClusterSource implements ClusterSource {
 
     private Map<Long, String> transactionalIds = Map.of();
     private long transactionalIdsAt;
+
+    // Created on first use, for "sample message" only. KafkaConsumer is not thread-safe: guarded by sampleLock.
+    private final Object sampleLock = new Object();
+    private KafkaConsumer<byte[], byte[]> sampler;
+    private final Random random = new Random();
 
     private boolean producersSupported = true;
     private boolean transactionsSupported = true;
@@ -307,8 +320,89 @@ public final class KafkaClusterSource implements ClusterSource {
         return exclude == null || !exclude.matcher(name).matches();
     }
 
+    // ---- sample message ----------------------------------------------------------------------
+
+    /**
+     * Picks a random non-empty partition and a random offset between its earliest and latest offsets, then reads
+     * the first message at or after it. Uses manual assignment with no group.id, so it joins no consumer group
+     * and commits nothing. Reads with read_committed, so aborted transactional messages are never shown.
+     */
+    @Override
+    public SampledMessage sampleMessage(String topic, int maxBytes) throws TimeoutException {
+        synchronized (sampleLock) {
+            KafkaConsumer<byte[], byte[]> c = sampler();
+            Duration timeout = Duration.ofMillis(timeoutMs);
+            try {
+                List<PartitionInfo> infos = c.partitionsFor(topic, timeout);
+                if (infos == null || infos.isEmpty()) throw new IllegalArgumentException("No topic named " + topic);
+                List<TopicPartition> tps = new ArrayList<>();
+                for (PartitionInfo pi : infos) tps.add(new TopicPartition(pi.topic(), pi.partition()));
+                Map<TopicPartition, Long> begin = c.beginningOffsets(tps, timeout);
+                Map<TopicPartition, Long> end = c.endOffsets(tps, timeout);
+                List<TopicPartition> nonEmpty = new ArrayList<>();
+                for (TopicPartition tp : tps) {
+                    if (end.getOrDefault(tp, 0L) > begin.getOrDefault(tp, 0L)) nonEmpty.add(tp);
+                }
+                if (nonEmpty.isEmpty()) return null;
+
+                TopicPartition tp = nonEmpty.get(random.nextInt(nonEmpty.size()));
+                long first = begin.get(tp), last = end.get(tp);
+                long offset = first + (long) (random.nextDouble() * (last - first));
+                c.assign(List.of(tp));
+                c.seek(tp, offset);
+
+                long deadline = System.currentTimeMillis() + timeoutMs;
+                boolean rewound = false;
+                while (System.currentTimeMillis() < deadline) {
+                    for (ConsumerRecord<byte[], byte[]> r : c.poll(Duration.ofMillis(300))) {
+                        return toSample(r, first, last, maxBytes);
+                    }
+                    // Past the picked offset there may only be compacted gaps or transaction markers: start over
+                    // from the beginning of the partition once.
+                    if (!rewound && c.position(tp, timeout) >= last) {
+                        c.seek(tp, first);
+                        rewound = true;
+                    }
+                }
+                throw new TimeoutException("No message could be read from " + tp + " within " + timeoutMs + " ms");
+            } finally {
+                c.assign(List.of());
+            }
+        }
+    }
+
+    private KafkaConsumer<byte[], byte[]> sampler() {
+        if (sampler == null) {
+            Properties p = config.kafkaProperties();
+            p.remove("group.id");
+            p.remove("group.instance.id");
+            p.put("client.id", p.getProperty("client.id", "kafka-flow-viewer") + "-sampler");
+            p.put("enable.auto.commit", "false");
+            p.put("auto.offset.reset", "earliest"); // if the picked offset was deleted by retention meanwhile
+            p.put("isolation.level", "read_committed");
+            p.put("max.poll.records", "1");
+            p.put("key.deserializer", ByteArrayDeserializer.class.getName());
+            p.put("value.deserializer", ByteArrayDeserializer.class.getName());
+            sampler = new KafkaConsumer<>(p);
+        }
+        return sampler;
+    }
+
+    private static SampledMessage toSample(ConsumerRecord<byte[], byte[]> r, long first, long last, int maxBytes) {
+        List<SampledMessage.Header> headers = new ArrayList<>();
+        for (Header h : r.headers()) {
+            headers.add(new SampledMessage.Header(h.key(), SampledMessage.Payload.of(h.value(), Math.min(maxBytes, 2048))));
+        }
+        return new SampledMessage(r.topic(), r.partition(), r.offset(), r.timestamp(), String.valueOf(r.timestampType()),
+                SampledMessage.Payload.of(r.key(), Math.min(maxBytes, 4096)), SampledMessage.Payload.of(r.value(), maxBytes),
+                headers, first, last - 1);
+    }
+
     @Override
     public void close() {
-        admin.close(java.time.Duration.ofSeconds(5));
+        admin.close(Duration.ofSeconds(5));
+        synchronized (sampleLock) {
+            if (sampler != null) sampler.close(Duration.ofSeconds(5));
+        }
     }
 }
