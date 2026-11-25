@@ -103,7 +103,7 @@ exponential moving average (`rate.smoothing`).
 ## Configuration
 
 Put settings in `kafka-flow.properties` in the working directory, pass `--config file.properties`, or use
-`--set key=value`. Every `kafka.*` key is handed to the AdminClient with the prefix removed, so anything the Kafka
+`--set key=value`. Flags override the file, which overrides the defaults. Every `kafka.*` key is handed to the AdminClient with the prefix removed, so anything the Kafka
 client supports works. See [`kafka-flow.example.properties`](kafka-flow.example.properties) and the defaults in
 [`src/main/resources/default.properties`](src/main/resources/default.properties).
 

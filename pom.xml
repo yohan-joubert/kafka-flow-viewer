@@ -18,6 +18,7 @@
         <slf4j.version>2.0.17</slf4j.version>
         <junit.version>5.11.4</junit.version>
         <confluent.version>7.9.9</confluent.version>
+        <picocli.version>4.7.7</picocli.version>
         <main.class>io.kafkaflow.KafkaFlowViewer</main.class>
     </properties>
 
@@ -42,6 +43,12 @@
             <groupId>io.confluent</groupId>
             <artifactId>kafka-avro-serializer</artifactId>
             <version>${confluent.version}</version>
+        </dependency>
+        <!-- Command-line parsing and help text. -->
+        <dependency>
+            <groupId>info.picocli</groupId>
+            <artifactId>picocli</artifactId>
+            <version>${picocli.version}</version>
         </dependency>
         <!-- kafka-clients brings slf4j-api 1.7, which cannot find slf4j-simple 2.x: logging would be silent. -->
         <dependency>

@@ -57,8 +57,9 @@ says why bytes couldn't be decoded. `AvroDecoder` handles the Confluent wire for
 
 ## Configuration
 
-`AppConfig` merges three layers, each overriding the previous: `default.properties` (which documents every key),
-then a properties file (`--config`, or `./kafka-flow.properties`), then CLI flags / `--set k=v`. Prefixed keys are
+`AppConfig` merges three `java.util.Properties` layers, each overriding the previous: `default.properties` (which
+documents every key), then a properties file (`--config`, or `./kafka-flow.properties`), then CLI flags parsed by
+picocli (`AppConfig.Cli`) and `--set k=v`. Prefixed keys are
 passed through with the prefix stripped:
 - `kafka.*` go to the Kafka clients;
 - `registry.*` go to the Schema Registry client, except `registry.url`. Their values are not trimmed, except
