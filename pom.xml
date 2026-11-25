@@ -17,15 +17,37 @@
         <kafka.version>3.9.1</kafka.version>
         <slf4j.version>2.0.17</slf4j.version>
         <junit.version>5.11.4</junit.version>
+        <confluent.version>7.9.9</confluent.version>
         <main.class>io.kafkaflow.KafkaFlowViewer</main.class>
     </properties>
 
+    <repositories>
+        <!-- Confluent's Schema Registry client and Avro serializer are not on Maven Central. -->
+        <repository>
+            <id>confluent</id>
+            <url>https://packages.confluent.io/maven/</url>
+        </repository>
+    </repositories>
+
     <dependencies>
-        <!-- The only runtime dependency: the official Kafka client (AdminClient + producer/consumer for the load generator). -->
+        <!-- The official Kafka client (AdminClient + producer/consumer for the load generator). Declared directly so
+             this version wins over the one the Confluent artifacts bring. -->
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
             <version>${kafka.version}</version>
+        </dependency>
+        <!-- Schema Registry client and Avro, to decode sampled Avro messages (and produce some in the load generator). -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>${confluent.version}</version>
+        </dependency>
+        <!-- kafka-clients brings slf4j-api 1.7, which cannot find slf4j-simple 2.x: logging would be silent. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>

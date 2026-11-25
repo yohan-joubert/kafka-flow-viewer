@@ -3,7 +3,7 @@
 A live view of what is flowing through a Kafka cluster: **producers → topics → consumer groups**, with messages per
 second on every link, consumer lag, and a warning colour when a group's lag keeps growing.
 
-It is a small Java 21 app (one dependency: `kafka-clients`) that polls the cluster with the AdminClient and streams
+It is a small Java 21 app (`kafka-clients`, plus Confluent's Schema Registry client to decode Avro) that polls the cluster with the AdminClient and streams
 snapshots to a browser page over Server-Sent Events. It never writes, never joins a consumer group and never commits offsets. It only reads message contents when you ask
 for a sample message.
 
@@ -22,15 +22,16 @@ Then open <http://localhost:8080>.
 To try it against a real broker with real traffic:
 
 ```bash
-docker compose up -d                          # single-node Kafka on localhost:9092
-java -cp target/kafka-flow-viewer.jar io.kafkaflow.tools.LoadGenerator localhost:9092
-java -jar target/kafka-flow-viewer.jar --bootstrap localhost:9092
+docker compose up -d                          # single-node Kafka on localhost:9092, Schema Registry on :8081
+java -cp target/kafka-flow-viewer.jar io.kafkaflow.tools.LoadGenerator localhost:9092 http://localhost:8081
+java -jar target/kafka-flow-viewer.jar --bootstrap localhost:9092 --registry http://localhost:8081
 ```
 
 The load generator creates `demo.*` topics, a few producers (one transactional) and consumer groups, including
 `slow-reporting`, which is deliberately too slow so you can watch its lag climb. It also runs a two-step processing
 chain, `demo.orders → order-enricher → demo.orders-enriched → shipping → demo.shipments → tracking`, using
-exactly-once consume-process-produce. Don't run it against production.
+exactly-once consume-process-produce. Given a registry URL, it also writes Avro records to `demo.users-avro`
+(read by `profile-sync`) to try Avro decoding; without it, it skips that topic. Don't run it against production.
 
 ## Using the UI
 
@@ -44,7 +45,9 @@ exactly-once consume-process-produce. Don't run it against production.
 - **Hide idle** removes topics with no traffic in or out.
 - **Sample message**: in a topic's details panel, *Show a random message* reads one message from a random partition
   at a random offset and shows its partition, offset, timestamp, key, value and headers. JSON is pretty-printed.
-  Binary values (Avro, Protobuf…) are shown as hex, and values over `sample.max.bytes` are cut. It reads through a
+  With a Schema Registry (`registry.url`), Avro keys and values in the Confluent format are decoded with their
+  schema and shown as JSON, with the schema name and id. Other binary values (Protobuf, Avro without a registry,
+  or a schema the registry doesn't have) are shown as hex with the reason. Values over `sample.max.bytes` are cut. It reads through a
   separate consumer with no group (manual assignment), so it joins no consumer group and commits nothing. It uses
   `read_committed`, so messages from aborted transactions never show. Turn it off with `sample.enabled=false`.
 - Link thickness and particle speed follow the rate (log scale). Dotted grey links carry nothing right now.
@@ -116,6 +119,8 @@ client supports works. See [`kafka-flow.example.properties`](kafka-flow.example.
 | `producers.idle.timeout.ms` | `60000` | hide producers silent for longer than this |
 | `sample.enabled` | `true` | allow *Show a random message* on topics |
 | `sample.max.bytes` | `65536` | longer keys and values are cut for display |
+| `registry.url` | empty | Schema Registry URL(s), comma separated, to decode Avro; also `--registry <url>` |
+| `registry.*` | | passed to the Schema Registry client with the prefix removed (auth, TLS, timeouts) |
 
 Secured cluster example:
 
@@ -126,12 +131,26 @@ kafka.sasl.mechanism=SCRAM-SHA-512
 kafka.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="viewer" password="…";
 ```
 
+Schema Registry with basic auth (Confluent Cloud: API key and secret) or TLS:
+
+```properties
+registry.url=https://psrc-xxxxx.europe-west3.gcp.confluent.cloud
+registry.basic.auth.user.info=<api key>:<api secret>
+#registry.schema.registry.ssl.truststore.location=/path/to/truststore.jks
+#registry.schema.registry.ssl.truststore.password=changeit
+```
+
+Any Confluent-compatible registry works: Confluent Platform or Cloud, Karapace, Redpanda, Apicurio (its
+`/apis/ccompat/v7` API). Only the Avro format is decoded; schemas are fetched by id, so the viewer only needs read
+access to schemas, and each schema is fetched once.
+
 ### ACLs for the viewer's principal
 
 - `Describe` on the cluster
 - `Describe` on topics (and `Read` on topics for producer discovery via `describeProducers`, and to sample messages)
 - `Describe` on consumer groups
 - `Describe` on transactional ids (optional, only to name transactional producers)
+- On the Schema Registry, if it has its own access control: read access to schemas (optional, only to decode Avro)
 
 ## HTTP API
 
@@ -151,7 +170,8 @@ src/main/java/io/kafkaflow/
   KafkaFlowViewer.java          entry point: poll loop + web server
   config/AppConfig.java         properties file + CLI flags
   source/KafkaClusterSource     AdminClient sampling (offsets, groups, producers), sample messages
-  source/SampledMessage         one message made readable (text, JSON or hex)
+  source/SampledMessage         one message made readable (text, JSON, Avro or hex)
+  source/AvroDecoder            Confluent wire format + Schema Registry -> Avro as JSON
   source/SimulatedClusterSource --demo data
   flow/FlowCalculator           counters -> rates, lag, links
   web/WebServer                 JDK HttpServer, static UI + SSE

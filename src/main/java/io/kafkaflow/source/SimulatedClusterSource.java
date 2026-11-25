@@ -6,6 +6,15 @@ import io.kafkaflow.source.ClusterSample.ProducerSample;
 import io.kafkaflow.source.ClusterSample.TopicSample;
 import io.kafkaflow.source.ClusterSample.Tp;
 
+import io.confluent.kafka.schemaregistry.avro.AvroSchema;
+import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.EncoderFactory;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -290,12 +299,16 @@ public final class SimulatedClusterSource implements ClusterSource {
                         sku, r.nextBoolean() ? "PAR-1" : "LYS-2", -(1 + r.nextInt(5)), r.nextInt(800), time);
             }
             case "user-clicks" -> {
-                // Not text: shows how binary formats look. Confluent wire format: magic byte 0, schema id, Avro body.
+                // Avro in the Confluent wire format, decoded with an in-memory "registry" (schema id 42).
                 key = null;
-                value = new byte[40 + r.nextInt(40)];
-                r.nextBytes(value);
-                value[0] = 0;
-                value[1] = 0; value[2] = 0; value[3] = 0; value[4] = 42;
+                GenericRecord click = new GenericData.Record(CLICK);
+                click.put("sessionId", "s_" + hex(r, 6));
+                click.put("userId", r.nextInt(3) == 0 ? null : customer);
+                click.put("page", r.nextBoolean() ? "/checkout" : "/products/" + sku);
+                click.put("element", r.nextBoolean() ? "add-to-cart" : "buy-now");
+                click.put("at", ts);
+                click.put("durationMs", 40 + r.nextInt(2000));
+                value = avro(CLICK_SCHEMA_ID, click);
                 headers.clear();
             }
             case "notifications" -> value = json("""
@@ -313,7 +326,37 @@ public final class SimulatedClusterSource implements ClusterSource {
         headers.add(header("content-type", topic.equals("user-clicks") ? "application/vnd.kafka.avro.v2" : "application/json", maxBytes));
         return new SampledMessage(topic, tp.partition(), offset, ts, "CreateTime",
                 key == null ? SampledMessage.Payload.NULL : SampledMessage.Payload.of(key.getBytes(java.nio.charset.StandardCharsets.UTF_8), maxBytes),
-                SampledMessage.Payload.of(value, maxBytes), headers, first, last);
+                DEMO_REGISTRY.decode(value, maxBytes), headers, first, last);
+    }
+
+    private static final int CLICK_SCHEMA_ID = 42;
+    private static final Schema CLICK = new Schema.Parser().parse("""
+            {"type": "record", "name": "UserClick", "namespace": "io.kafkaflow.demo", "fields": [
+              {"name": "sessionId", "type": "string"},
+              {"name": "userId", "type": ["null", "string"], "default": null},
+              {"name": "page", "type": "string"},
+              {"name": "element", "type": "string"},
+              {"name": "at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+              {"name": "durationMs", "type": "int"}
+            ]}""");
+    private static final AvroDecoder DEMO_REGISTRY = new AvroDecoder(id -> {
+        if (id != CLICK_SCHEMA_ID) throw new RestClientException("Schema " + id + " not found", 404, 40403);
+        return new AvroSchema(CLICK);
+    });
+
+    /** Confluent wire format: magic byte 0, 4-byte schema id, Avro binary body. */
+    private static byte[] avro(int schemaId, GenericRecord record) {
+        try {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            out.write(0);
+            out.write(java.nio.ByteBuffer.allocate(4).putInt(schemaId).array());
+            BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
+            new GenericDatumWriter<GenericRecord>(record.getSchema()).write(record, encoder);
+            encoder.flush();
+            return out.toByteArray();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
     }
 
     private static byte[] json(String format, Object... args) {

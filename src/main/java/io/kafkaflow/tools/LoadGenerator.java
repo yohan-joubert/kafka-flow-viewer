@@ -1,5 +1,9 @@
 package io.kafkaflow.tools;
 
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -13,12 +17,15 @@ import org.apache.kafka.common.errors.TopicExistsException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
+import java.math.BigInteger;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
@@ -27,7 +34,9 @@ import java.util.concurrent.ExecutionException;
  * a few producers and consumer groups on {@code demo.*} topics, one group deliberately slow, and a
  * two-step processing chain (orders -> order-enricher -> orders-enriched -> shipping -> shipments -> tracking).
  *
- * <pre>java -cp kafka-flow-viewer.jar io.kafkaflow.tools.LoadGenerator localhost:9092</pre>
+ * <pre>java -cp kafka-flow-viewer.jar io.kafkaflow.tools.LoadGenerator localhost:9092 [http://localhost:8081]</pre>
+ *
+ * With a Schema Registry URL as second argument it also writes Avro to {@code demo.users-avro}.
  *
  * Do not point this at a production cluster: it creates topics and writes test messages.
  */
@@ -35,7 +44,9 @@ public final class LoadGenerator {
 
     public static void main(String[] args) throws Exception {
         String bootstrap = args.length > 0 ? args[0] : "localhost:9092";
-        System.out.println("Generating demo traffic on " + bootstrap + " (Ctrl+C to stop)");
+        String registry = args.length > 1 ? args[1] : null;
+        System.out.println("Generating demo traffic on " + bootstrap
+                + (registry == null ? "" : ", Avro schemas in " + registry) + " (Ctrl+C to stop)");
 
         createTopics(bootstrap,
                 new NewTopic("demo.orders", 6, (short) 1),
@@ -66,6 +77,12 @@ public final class LoadGenerator {
         threads.add(relay(bootstrap, "order-enricher", "demo.orders", "demo.orders-enriched"));
         threads.add(relay(bootstrap, "shipping", "demo.orders-enriched", "demo.shipments"));
         threads.add(consumer(bootstrap, "tracking", List.of("demo.shipments"), 0));
+
+        if (registry != null) {
+            createTopics(bootstrap, new NewTopic("demo.users-avro", 3, (short) 1));
+            threads.add(avroProducer(bootstrap, registry, "user-service", "demo.users-avro", 20));
+            threads.add(consumer(bootstrap, "profile-sync", List.of("demo.users-avro"), 0));
+        }
 
         for (Thread t : threads) t.join();
     }
@@ -106,6 +123,53 @@ public final class LoadGenerator {
                         producer.send(new ProducerRecord<>(topic, "key-" + (n % 97), "{\"seq\":" + n + ",\"id\":\"" + UUID.randomUUID() + "\"}"));
                     }
                     if (txId != null) producer.commitTransaction();
+                    sleepRemaining(t0, 100);
+                }
+            } catch (Exception e) {
+                System.err.println(clientId + " stopped: " + e);
+            }
+        });
+    }
+
+    private static final Schema USER = new Schema.Parser().parse("""
+            {"type": "record", "name": "User", "namespace": "demo", "fields": [
+              {"name": "userId", "type": "long"},
+              {"name": "email", "type": "string"},
+              {"name": "nickname", "type": ["null", "string"], "default": null},
+              {"name": "plan", "type": {"type": "enum", "name": "Plan", "symbols": ["FREE", "PRO", "TEAM"]}},
+              {"name": "signupAt", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+              {"name": "credit", "type": {"type": "bytes", "logicalType": "decimal", "precision": 9, "scale": 2}},
+              {"name": "tags", "type": {"type": "array", "items": "string"}}
+            ]}""");
+
+    /** Writes Avro records with KafkaAvroSerializer, which registers the schema under {@code <topic>-value}. */
+    private static Thread avroProducer(String bootstrap, String registry, String clientId, String topic, int ratePerSec) {
+        return Thread.ofPlatform().name("producer-" + clientId).start(() -> {
+            Properties p = new Properties();
+            p.put("bootstrap.servers", bootstrap);
+            p.put("client.id", clientId);
+            p.put("enable.idempotence", "true");
+            p.put("linger.ms", "20");
+            p.put("key.serializer", StringSerializer.class.getName());
+            p.put("value.serializer", KafkaAvroSerializer.class.getName());
+            p.put("schema.registry.url", registry);
+            Schema plan = USER.getField("plan").schema();
+            Random random = new Random();
+            try (KafkaProducer<String, Object> producer = new KafkaProducer<>(p)) {
+                long n = 0;
+                while (!Thread.currentThread().isInterrupted()) {
+                    long t0 = System.nanoTime();
+                    for (int i = 0; i < Math.max(1, ratePerSec / 10); i++, n++) {
+                        GenericRecord user = new GenericData.Record(USER);
+                        user.put("userId", 1_000_000_000_000L + n);
+                        user.put("email", "user" + n + "@example.com");
+                        user.put("nickname", n % 3 == 0 ? null : "user-" + n);
+                        user.put("plan", new GenericData.EnumSymbol(plan, plan.getEnumSymbols().get((int) (n % 3))));
+                        user.put("signupAt", System.currentTimeMillis());
+                        user.put("credit", ByteBuffer.wrap(BigInteger.valueOf(random.nextInt(100_000)).toByteArray()));
+                        user.put("tags", n % 2 == 0 ? List.of("newsletter") : List.of());
+                        producer.send(new ProducerRecord<>(topic, "user-" + n, user));
+                    }
                     sleepRemaining(t0, 100);
                 }
             } catch (Exception e) {

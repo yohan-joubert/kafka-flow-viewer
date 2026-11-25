@@ -90,6 +90,7 @@ public final class KafkaClusterSource implements ClusterSource {
     private final Object sampleLock = new Object();
     private KafkaConsumer<byte[], byte[]> sampler;
     private final Random random = new Random();
+    private final AvroDecoder avro;
 
     private boolean producersSupported = true;
     private boolean transactionsSupported = true;
@@ -101,6 +102,9 @@ public final class KafkaClusterSource implements ClusterSource {
         props.putIfAbsent("request.timeout.ms", String.valueOf(timeoutMs));
         props.putIfAbsent("default.api.timeout.ms", String.valueOf(timeoutMs * 2));
         this.admin = Admin.create(props);
+        this.avro = config.registryUrl() == null
+                ? AvroDecoder.disabled()
+                : AvroDecoder.forRegistry(config.registryUrl(), config.registryConfig());
     }
 
     @Override
@@ -329,6 +333,15 @@ public final class KafkaClusterSource implements ClusterSource {
      */
     @Override
     public SampledMessage sampleMessage(String topic, int maxBytes) throws TimeoutException {
+        Picked picked = pick(topic);
+        // Decoding may call the Schema Registry: done outside sampleLock so a slow registry never blocks the consumer.
+        return picked == null ? null : toSample(picked, maxBytes);
+    }
+
+    /** A record read for sampling, with the offset range of its partition at that time. */
+    private record Picked(ConsumerRecord<byte[], byte[]> record, long first, long last) {}
+
+    private Picked pick(String topic) throws TimeoutException {
         synchronized (sampleLock) {
             KafkaConsumer<byte[], byte[]> c = sampler();
             Duration timeout = Duration.ofMillis(timeoutMs);
@@ -355,7 +368,7 @@ public final class KafkaClusterSource implements ClusterSource {
                 boolean rewound = false;
                 while (System.currentTimeMillis() < deadline) {
                     for (ConsumerRecord<byte[], byte[]> r : c.poll(Duration.ofMillis(300))) {
-                        return toSample(r, first, last, maxBytes);
+                        return new Picked(r, first, last);
                     }
                     // Past the picked offset there may only be compacted gaps or transaction markers: start over
                     // from the beginning of the partition once.
@@ -388,19 +401,21 @@ public final class KafkaClusterSource implements ClusterSource {
         return sampler;
     }
 
-    private static SampledMessage toSample(ConsumerRecord<byte[], byte[]> r, long first, long last, int maxBytes) {
+    private SampledMessage toSample(Picked picked, int maxBytes) {
+        ConsumerRecord<byte[], byte[]> r = picked.record();
         List<SampledMessage.Header> headers = new ArrayList<>();
         for (Header h : r.headers()) {
             headers.add(new SampledMessage.Header(h.key(), SampledMessage.Payload.of(h.value(), Math.min(maxBytes, 2048))));
         }
         return new SampledMessage(r.topic(), r.partition(), r.offset(), r.timestamp(), String.valueOf(r.timestampType()),
-                SampledMessage.Payload.of(r.key(), Math.min(maxBytes, 4096)), SampledMessage.Payload.of(r.value(), maxBytes),
-                headers, first, last - 1);
+                avro.decode(r.key(), Math.min(maxBytes, 4096)), avro.decode(r.value(), maxBytes),
+                headers, picked.first(), picked.last() - 1);
     }
 
     @Override
     public void close() {
         admin.close(Duration.ofSeconds(5));
+        avro.close();
         synchronized (sampleLock) {
             if (sampler != null) sampler.close(Duration.ofSeconds(5));
         }

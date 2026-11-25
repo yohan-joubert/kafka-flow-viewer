@@ -743,9 +743,13 @@ async function loadSample() {
   renderSample();
 }
 
-/** Pretty-prints JSON values; anything else is shown as it is. */
+/**
+ * Pretty-prints JSON values; anything else is shown as it is. Avro arrives already rendered as indented JSON by
+ * the viewer and is not re-parsed here: JSON.parse would round longs above 2^53.
+ */
 function displayValue(p) {
   if (p.encoding === "null") return null;
+  if (p.encoding === "avro") return p.text;
   if (p.encoding === "text" && !p.truncated) {
     const t = p.text.trim();
     if (t.startsWith("{") || t.startsWith("[")) {
@@ -761,13 +765,24 @@ function fmtBytes(n) {
   return (n / 1048576).toFixed(1) + " MB";
 }
 
+/** A note under a key or value, as escaped HTML (schema names and problems come from the cluster). */
 function payloadNote(p, what) {
-  if (p.encoding === "hex") {
-    return `${what} is binary (${fmtBytes(p.size)}), shown as hex${p.truncated ? ", first bytes only" : ""}. `
-      + `It may use a format like Avro or Protobuf that needs a schema to decode.`;
+  if (p.encoding === "avro") {
+    const schema = p.schema ? ` with schema ${p.schema.name} (id ${p.schema.id})` : "";
+    return esc(`${what} decoded from Avro${schema}.${p.truncated ? ` Cut for display: ${fmtBytes(p.size)} of Avro in total.` : ""}`);
   }
-  if (p.truncated) return `${what} cut for display: ${fmtBytes(p.size)} in total.`;
+  if (p.encoding === "hex") {
+    return esc(`${what} is binary (${fmtBytes(p.size)}), shown as hex${p.truncated ? ", first bytes only" : ""}. `
+      + (p.problem || `It may use a format like Avro or Protobuf that needs a schema to decode.`));
+  }
+  if (p.truncated) return esc(`${what} cut for display: ${fmtBytes(p.size)} in total.`);
   return "";
+}
+
+function valueClass(p, shown) {
+  if (p.encoding === "hex") return " hex";
+  if (p.encoding === "avro") return p.text.startsWith("{") || p.text.startsWith("[") ? " json" : "";
+  return shown !== p.text ? " json" : "";
 }
 
 function renderSample() {
@@ -797,10 +812,10 @@ function renderSample() {
       <p class="sample-when">${esc(when)}</p>
       <p class="sample-range">Picked from offsets ${m.earliestOffset.toLocaleString()} to ${m.latestOffset.toLocaleString()} of this partition.</p>
       <h5>Key</h5>
-      ${m.key.encoding === "null" ? `<p class="note">No key</p>` : `<pre class="sample-key">${esc(m.key.text)}</pre>`}
+      ${m.key.encoding === "null" ? `<p class="note">No key</p>` : `<pre class="sample-key${valueClass(m.key, m.key.text)}">${esc(m.key.text)}</pre>`}
       ${payloadNote(m.key, "Key") ? `<p class="note">${payloadNote(m.key, "Key")}</p>` : ""}
       <h5>Value <span class="size">${m.value.encoding === "null" ? "" : fmtBytes(m.value.size)}</span></h5>
-      ${value == null ? `<p class="note">No value (a tombstone, which deletes this key in a compacted topic)</p>` : `<pre class="sample-value${m.value.encoding === "hex" ? " hex" : value !== m.value.text ? " json" : ""}" tabindex="0">${esc(value)}</pre>`}
+      ${value == null ? `<p class="note">No value (a tombstone, which deletes this key in a compacted topic)</p>` : `<pre class="sample-value${valueClass(m.value, value)}" tabindex="0">${esc(value)}</pre>`}
       ${payloadNote(m.value, "Value") ? `<p class="note">${payloadNote(m.value, "Value")}</p>` : ""}
       ${m.headers.length ? `<h5>Headers <span class="size">${m.headers.length}</span></h5><dl class="sample-headers">${m.headers.map((h) =>
         `<div><dt>${esc(h.key)}</dt><dd>${h.value.encoding === "null" ? "null" : esc(h.value.text)}</dd></div>`).join("")}</dl>` : ""}`;

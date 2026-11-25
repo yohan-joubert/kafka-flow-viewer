@@ -4,7 +4,10 @@ import java.lang.reflect.RecordComponent;
 import java.util.Collection;
 import java.util.Map;
 
-/** Minimal JSON writer for records, collections, maps, strings, numbers and booleans (keeps the jar dependency-free). */
+/**
+ * Minimal JSON writer for records, collections, maps, strings, numbers and booleans, for the viewer's own API.
+ * Rates are rounded to 3 decimals, so it is not meant for message contents (see AvroDecoder, which uses Jackson).
+ */
 public final class Json {
 
     private Json() {}

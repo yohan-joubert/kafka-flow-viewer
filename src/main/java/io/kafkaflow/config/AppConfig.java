@@ -6,6 +6,8 @@ import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.Properties;
 import java.util.regex.Pattern;
 
@@ -16,15 +18,17 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li>built-in defaults,</li>
  *   <li>a properties file ({@code --config path}, or {@code ./kafka-flow.properties} if present),</li>
- *   <li>command-line flags ({@code --bootstrap}, {@code --port}, {@code --demo}, {@code --set key=value}).</li>
+ *   <li>command-line flags ({@code --bootstrap}, {@code --port}, {@code --demo}, {@code --registry}, {@code --set key=value}).</li>
  * </ol>
  *
  * <p>Every key starting with {@code kafka.} is passed (prefix removed) to the Kafka AdminClient, so any client
  * setting works: {@code kafka.security.protocol=SASL_SSL}, {@code kafka.sasl.jaas.config=...}, etc.
+ * Likewise every {@code registry.*} key but {@code registry.url} goes to the Schema Registry client.
  */
 public final class AppConfig {
 
     public static final String KAFKA_PREFIX = "kafka.";
+    public static final String REGISTRY_PREFIX = "registry.";
 
     private final Properties props;
 
@@ -58,6 +62,7 @@ public final class AppConfig {
                 case "--config" -> i++;
                 case "--demo" -> p.setProperty("demo", "true");
                 case "--bootstrap", "-b" -> { p.setProperty("kafka.bootstrap.servers", require(a, next)); i++; }
+                case "--registry" -> { p.setProperty("registry.url", require(a, next)); i++; }
                 case "--port", "-p" -> { p.setProperty("http.port", require(a, next)); i++; }
                 case "--interval" -> { p.setProperty("poll.interval.ms", require(a, next)); i++; }
                 case "--set" -> {
@@ -109,6 +114,7 @@ public final class AppConfig {
                 Options:
                   --bootstrap, -b <hosts>   Kafka bootstrap servers
                   --config <file>           properties file (defaults to ./kafka-flow.properties if it exists)
+                  --registry <url>          Schema Registry URL, to decode Avro sample messages
                   --port, -p <port>         HTTP port for the UI (default 8080)
                   --interval <ms>           polling interval (default 2000)
                   --set key=value           set any property, e.g. --set kafka.security.protocol=SSL
@@ -145,6 +151,31 @@ public final class AppConfig {
             }
         }
         return k;
+    }
+
+    /** Schema Registry URL(s), comma separated, or null when no registry is configured. */
+    public String registryUrl() {
+        String v = props.getProperty(REGISTRY_PREFIX + "url", "").trim();
+        return v.isEmpty() ? null : v;
+    }
+
+    /**
+     * Schema Registry client settings: every {@code registry.*} key but the URL, with the prefix removed.
+     * Giving {@code registry.basic.auth.user.info} is enough for basic auth: the credentials source then defaults
+     * to {@code USER_INFO}.
+     */
+    public Map<String, Object> registryConfig() {
+        Map<String, Object> c = new TreeMap<>();
+        for (String name : props.stringPropertyNames()) {
+            if (name.startsWith(REGISTRY_PREFIX) && !name.equals(REGISTRY_PREFIX + "url")) {
+                String key = name.substring(REGISTRY_PREFIX.length());
+                String value = props.getProperty(name);
+                // Values are passed as given (a password may end with a space); only durations are trimmed.
+                c.put(key, key.endsWith(".ms") || key.endsWith(".sec") ? value.trim() : value);
+            }
+        }
+        if (c.containsKey("basic.auth.user.info")) c.putIfAbsent("basic.auth.credentials.source", "USER_INFO");
+        return c;
     }
 
     public String bootstrapServers() {
